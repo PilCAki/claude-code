@@ -55,8 +55,13 @@ def _check_skill_completion(
         outputs = fm.get("outputs", "")
         if not outputs:
             continue
+        # Extract just the path portion (before descriptive text, placeholders, or parens)
+        output_path = outputs.split("(")[0].split("<")[0].strip()
+        # If it still has spaces, take only the first token (the path)
+        if " " in output_path:
+            output_path = output_path.split()[0]
         # Normalize output pattern
-        output_pattern = outputs.replace("\\", "/").lower().rstrip("/")
+        output_pattern = output_path.replace("\\", "/").lower().rstrip("/")
         # Check if the written path contains the output pattern
         if output_pattern and output_pattern in written_lower:
             completed_skills.add(skill_name)
