@@ -20,6 +20,7 @@ from .prompt_compiler import (
     materialize_workspace_instructions,
 )
 from .reports import CheckResult, PreflightReport, SmokeTestReport
+from .skill_assets import build_skill_catalog
 
 if TYPE_CHECKING:
     from copilot import CopilotClient as SDKCopilotClient
@@ -285,7 +286,13 @@ class CopilotCodeClient:
         return CopilotCodeSession(session, self._memory_store)
 
     def _session_kwargs(self, *, on_event: Any | None = None) -> dict[str, Any]:
-        hooks = build_default_hooks(self.config, self._memory_store)
+        _, skill_map = build_skill_catalog(
+            self._skill_directories(),
+            disabled_skills=self._disabled_skills(),
+        )
+        hooks = build_default_hooks(
+            self.config, self._memory_store, skill_map=skill_map,
+        )
         permission_handler = build_permission_handler(
             policy=self.config.permission_policy,
             permission_handler=self.config.permission_handler,

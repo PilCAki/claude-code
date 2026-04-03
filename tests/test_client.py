@@ -226,3 +226,34 @@ def test_session_kwargs_passes_skill_directories_to_system_message(tmp_path: Pat
     system_message = kwargs["system_message"]
     assert "Available Skills" in system_message["content"]
     assert "test-skill" in system_message["content"]
+
+
+def test_session_kwargs_passes_skill_map_to_hooks(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "test-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: A test.\ntype: test-type\noutputs: outputs/test/\nrequires: none\n---\n\n# Test\n",
+        encoding="utf-8",
+    )
+
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        enabled_skills=(),
+        extra_skill_directories=[str(tmp_path / "skills")],
+    )
+    client = CopilotCodeClient(config)
+    kwargs = client._session_kwargs()
+    hooks = kwargs["hooks"]
+
+    result = hooks["on_post_tool_use"](
+        {
+            "toolName": "write_file",
+            "toolArgs": {"path": str(tmp_path / "outputs" / "test" / "result.csv")},
+            "toolResult": "File written.",
+        },
+        {},
+    )
+
+    assert result is not None
+    assert "test-skill" in result["additionalContext"]
