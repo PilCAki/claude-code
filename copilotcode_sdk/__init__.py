@@ -12,6 +12,7 @@ from .prompt_compiler import (
     render_claude_md_template,
     render_copilot_instructions_template,
 )
+from .instructions import InstructionBundle, load_workspace_instructions
 from .reports import CheckResult, PreflightReport, SmokeTestReport
 from .skill_assets import build_skill_catalog, parse_skill_frontmatter
 
@@ -24,6 +25,7 @@ __all__ = [
     "DEFAULT_AGENT_NAMES",
     "DEFAULT_BRAND",
     "DEFAULT_SKILL_NAMES",
+    "InstructionBundle",
     "MemoryStore",
     "PermissionPolicy",
     "PreflightReport",
@@ -31,6 +33,7 @@ __all__ = [
     "build_default_custom_agents",
     "build_skill_catalog",
     "build_system_message",
+    "load_workspace_instructions",
     "materialize_workspace_instructions",
     "parse_skill_frontmatter",
     "render_claude_md_template",
