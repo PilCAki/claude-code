@@ -363,3 +363,78 @@ def test_post_tool_use_extraction_respects_min_turn_gap(tmp_path: Path) -> None:
     )
 
     assert result is None
+
+
+def test_post_tool_use_suggests_available_skills(tmp_path: Path) -> None:
+    intake_dir = tmp_path / "skills" / "intake"
+    intake_dir.mkdir(parents=True)
+    (intake_dir / "SKILL.md").write_text(
+        "---\nname: intake\ndescription: Ingest.\ntype: data-intake\n"
+        "outputs: outputs/intake/\nrequires: none\n---\n\n# Intake\n",
+        encoding="utf-8",
+    )
+    analysis_dir = tmp_path / "skills" / "analysis"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "SKILL.md").write_text(
+        "---\nname: analysis\ndescription: Analyze.\ntype: rcm-analysis\n"
+        "outputs: outputs/analysis/\nrequires: data-intake\n---\n\n# Analysis\n",
+        encoding="utf-8",
+    )
+
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extraction_tool_call_interval=999,
+        extraction_min_turn_gap=999,
+        reminder_reinjection_interval=0,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    _, skill_map = build_skill_catalog([str(tmp_path / "skills")])
+    hooks = build_default_hooks(config, store, skill_map=skill_map)
+
+    # Simulate calls to pass SUGGESTION_TURN_THRESHOLD (3) and SUGGESTION_INTERVAL (15).
+    # Condition: count > 3 AND count - last_suggestion >= 15, last_suggestion starts at 0.
+    # First fires at call 15: 15 > 3 AND 15 - 0 >= 15 → fires.
+    # Run 14 warm-up calls, then the 15th call is the final assertion call.
+    for i in range(14):
+        hooks["on_post_tool_use"](
+            {"toolName": "read", "toolResult": "ok"},
+            {},
+        )
+
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "ok"},
+        {},
+    )
+
+    assert result is not None
+    ctx = result["additionalContext"]
+    assert "intake" in ctx.lower()
+
+
+def test_post_tool_use_no_suggestion_before_threshold(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "skills" / "intake"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: intake\ndescription: Ingest.\ntype: data-intake\n"
+        "outputs: outputs/intake/\nrequires: none\n---\n\n# Intake\n",
+        encoding="utf-8",
+    )
+
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extraction_tool_call_interval=999,
+        extraction_min_turn_gap=999,
+        reminder_reinjection_interval=0,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    _, skill_map = build_skill_catalog([str(tmp_path / "skills")])
+    hooks = build_default_hooks(config, store, skill_map=skill_map)
+
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "ok"},
+        {},
+    )
+
+    assert result is None

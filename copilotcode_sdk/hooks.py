@@ -11,6 +11,9 @@ from .extraction import should_extract, build_extraction_prompt
 from .instructions import load_workspace_instructions
 from .memory import MemoryStore
 
+SUGGESTION_TURN_THRESHOLD = 3
+SUGGESTION_INTERVAL = 15
+
 PATH_KEYS = ("path", "file", "dir", "directory", "cwd", "workspace")
 SHELL_TOOL_NAMES = {"bash", "shell", "execute", "powershell"}
 NOISY_TOOL_NAMES = {
@@ -22,6 +25,27 @@ NOISY_TOOL_NAMES = {
     "read",
 }
 WRITE_TOOL_NAMES = {"write_file", "write", "edit", "create_file"}
+
+
+def _find_suggestable_skills(
+    skill_map: dict[str, dict[str, str]],
+    completed_skills: set[str],
+) -> list[str]:
+    """Find skills that are not started and whose prerequisites are met."""
+    completed_types = {
+        fm.get("type", "")
+        for name, fm in skill_map.items()
+        if name in completed_skills and fm.get("type")
+    }
+
+    suggestable = []
+    for name, fm in skill_map.items():
+        if name in completed_skills:
+            continue
+        requires = fm.get("requires", "").strip().lower()
+        if not requires or requires == "none" or requires in completed_types:
+            suggestable.append(name)
+    return suggestable
 
 
 def _check_skill_completion(
@@ -130,6 +154,7 @@ def build_default_hooks(
     _completed_skills: set[str] = set()
     _tool_call_count = [0]  # mutable counter in list for closure
     _last_extraction_turn = [0]
+    _last_suggestion_turn = [0]
     _total_result_chars = [0]
 
     def on_session_start(_: dict[str, Any], __: dict[str, str]) -> dict[str, Any] | None:
@@ -283,6 +308,23 @@ def build_default_hooks(
                         "If you suspect the output looks wrong due to formatting, redirect to a file "
                         "(e.g. `python script.py > out.txt`) and read it with `view` to see the real output. "
                         "If the output is actually correct, stop editing and declare success."
+                    ),
+                }
+
+        # Prompt suggestion: nudge toward available skills
+        if (
+            skill_map
+            and _tool_call_count[0] > SUGGESTION_TURN_THRESHOLD
+            and _tool_call_count[0] - _last_suggestion_turn[0] >= SUGGESTION_INTERVAL
+        ):
+            suggestable = _find_suggestable_skills(skill_map, _completed_skills)
+            if suggestable:
+                _last_suggestion_turn[0] = _tool_call_count[0]
+                names = ", ".join(suggestable)
+                return {
+                    "additionalContext": (
+                        f"Reminder: the following skills are available and their prerequisites are met: {names}. "
+                        "Check the skill catalog if you haven't started these yet."
                     ),
                 }
 
