@@ -85,6 +85,9 @@ class CopilotCodeConfig:
     shell_timeout_ms: int = 120_000
     noisy_tool_char_limit: int = 8_000
     reminder_reinjection_interval: int = 15
+    extraction_tool_call_interval: int = 20
+    extraction_char_threshold: int = 50_000
+    extraction_min_turn_gap: int = 10
     path_allowlist: Sequence[str | Path] = field(default_factory=tuple)
     permission_policy: PermissionPolicy = "safe"
     approved_shell_prefixes: Sequence[str] = field(
