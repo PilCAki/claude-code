@@ -194,3 +194,129 @@ def test_session_start_hook_uses_instruction_loader(tmp_path: Path) -> None:
     # Verify ordering: rules before project before github
     assert ctx.index("snake_case") < ctx.index("Project-level rules.")
     assert ctx.index("Project-level rules.") < ctx.index("GitHub rules.")
+
+
+from copilotcode_sdk.skill_assets import build_skill_catalog
+
+
+def _build_hooks_with_skills(
+    tmp_path: Path,
+) -> tuple[CopilotCodeConfig, MemoryStore, dict[str, object]]:
+    """Build hooks with a skill map for skill-completion testing."""
+    intake_dir = tmp_path / "skills" / "excel-workbook-intake"
+    intake_dir.mkdir(parents=True)
+    (intake_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: excel-workbook-intake\n"
+        "description: Ingest workbook.\n"
+        "type: data-intake\n"
+        "outputs: outputs/intake/\n"
+        "requires: none\n"
+        "---\n\n# Intake\n",
+        encoding="utf-8",
+    )
+    analysis_dir = tmp_path / "skills" / "rcm-analysis"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: rcm-analysis\n"
+        "description: Analyze data.\n"
+        "type: rcm-analysis\n"
+        "outputs: outputs/rcm_analysis/\n"
+        "requires: data-intake\n"
+        "---\n\n# Analysis\n",
+        encoding="utf-8",
+    )
+
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extra_skill_directories=[str(tmp_path / "skills")],
+        enabled_skills=(),
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    _, skill_map = build_skill_catalog([str(tmp_path / "skills")])
+    hooks = build_default_hooks(config, store, skill_map=skill_map)
+    return config, store, hooks
+
+
+def test_post_tool_use_detects_skill_completion(tmp_path: Path) -> None:
+    _, _, hooks = _build_hooks_with_skills(tmp_path)
+
+    result = hooks["on_post_tool_use"](
+        {
+            "toolName": "write_file",
+            "toolArgs": {"path": str(tmp_path / "outputs" / "intake" / "data.parquet")},
+            "toolResult": "File written.",
+        },
+        {},
+    )
+
+    assert result is not None
+    assert "excel-workbook-intake" in result["additionalContext"]
+    assert "rcm-analysis" in result["additionalContext"]
+
+
+def test_post_tool_use_no_match_for_unrelated_path(tmp_path: Path) -> None:
+    _, _, hooks = _build_hooks_with_skills(tmp_path)
+
+    result = hooks["on_post_tool_use"](
+        {
+            "toolName": "write_file",
+            "toolArgs": {"path": str(tmp_path / "src" / "main.py")},
+            "toolResult": "File written.",
+        },
+        {},
+    )
+
+    assert result is None
+
+
+def test_post_tool_use_reinjects_reminder_after_n_calls(tmp_path: Path) -> None:
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        reminder_reinjection_interval=3,
+    )
+    skill_dir = tmp_path / "skills" / "test-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: Test.\ntype: test-type\nrequires: none\noutputs: outputs/test/\n---\n\n# Test\n",
+        encoding="utf-8",
+    )
+    _, skill_map = build_skill_catalog([str(tmp_path / "skills")])
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    hooks = build_default_hooks(config, store, skill_map=skill_map)
+
+    # Make 2 calls — no reminder yet
+    for _ in range(2):
+        hooks["on_post_tool_use"](
+            {"toolName": "read", "toolResult": "content"},
+            {},
+        )
+
+    # 3rd call — should get reminder
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "content"},
+        {},
+    )
+
+    assert result is not None
+    assert "test-skill" in result["additionalContext"]
+
+
+def test_post_tool_use_no_reminder_without_skill_map(tmp_path: Path) -> None:
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        reminder_reinjection_interval=1,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    hooks = build_default_hooks(config, store)
+
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "content"},
+        {},
+    )
+
+    assert result is None

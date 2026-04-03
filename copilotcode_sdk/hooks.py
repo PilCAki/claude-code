@@ -20,11 +20,96 @@ NOISY_TOOL_NAMES = {
     "view",
     "read",
 }
+WRITE_TOOL_NAMES = {"write_file", "write", "edit", "create_file"}
+
+
+def _check_skill_completion(
+    tool_name: str,
+    tool_args: Any,
+    skill_map: dict[str, dict[str, str]],
+    completed_skills: set[str],
+) -> str | None:
+    """Check if a tool call's output path matches a skill's outputs pattern.
+
+    Returns an additionalContext nudge string, or None.
+    """
+    if tool_name.lower() not in WRITE_TOOL_NAMES:
+        return None
+    if not isinstance(tool_args, dict):
+        return None
+
+    written_path = ""
+    for key in ("path", "filePath", "file_path", "file"):
+        if key in tool_args:
+            written_path = str(tool_args[key])
+            break
+    if not written_path:
+        return None
+
+    # Normalize to forward slashes for matching
+    written_lower = written_path.replace("\\", "/").lower()
+
+    for skill_name, fm in skill_map.items():
+        if skill_name in completed_skills:
+            continue
+        outputs = fm.get("outputs", "")
+        if not outputs:
+            continue
+        # Normalize output pattern
+        output_pattern = outputs.replace("\\", "/").lower().rstrip("/")
+        # Check if the written path contains the output pattern
+        if output_pattern and output_pattern in written_lower:
+            completed_skills.add(skill_name)
+            # Find downstream skills
+            skill_type = fm.get("type", "")
+            downstream = [
+                s["name"]
+                for s in skill_map.values()
+                if s.get("requires") == skill_type and s["name"] not in completed_skills
+            ] if skill_type else []
+            parts = [
+                f"You appear to have completed the **{skill_name}** skill.",
+            ]
+            if downstream:
+                names = ", ".join(downstream)
+                parts.append(
+                    f"Check the skill catalog \u2014 the following downstream skills may now be triggered: {names}. "
+                    "Read their SKILL.md files for methodology."
+                )
+            else:
+                parts.append(
+                    "Check the skill catalog for any remaining skills."
+                )
+            return " ".join(parts)
+
+    return None
+
+
+def _build_skill_reminder(
+    skill_map: dict[str, dict[str, str]],
+    completed_skills: set[str],
+) -> str:
+    """Build a compact skill-status reminder for reinjection."""
+    lines = ["**Skill status reminder:**"]
+    for name, fm in skill_map.items():
+        status = "DONE" if name in completed_skills else "not started"
+        desc = fm.get("description", "")
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+        lines.append(f"- {name} [{status}]: {desc}")
+    lines.append("")
+    lines.append(
+        "After completing a skill, check if downstream skills should be triggered next. "
+        "Do not stop if there are remaining skills whose prerequisites are now met."
+    )
+    return "\n".join(lines)
 
 
 def build_default_hooks(
     config: CopilotCodeConfig,
     memory_store: MemoryStore,
+    *,
+    skill_map: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     allowed_roots = tuple(
         path.resolve(strict=False)
@@ -36,6 +121,8 @@ def build_default_hooks(
 
     # Ring buffer for shell command repeat detection (anti-loop).
     _recent_shell: list[tuple[str, str]] = []
+    _completed_skills: set[str] = set()
+    _tool_call_count = [0]  # mutable counter in list for closure
 
     def on_session_start(_: dict[str, Any], __: dict[str, str]) -> dict[str, Any] | None:
         memory_store.ensure()
@@ -103,7 +190,27 @@ def build_default_hooks(
         _: dict[str, str],
     ) -> dict[str, Any] | None:
         tool_name = str(input_data.get("toolName", "")).lower()
+        tool_args = input_data.get("toolArgs")
         tool_result = input_data.get("toolResult")
+        _tool_call_count[0] += 1
+
+        # Skill-completion detection
+        if skill_map:
+            nudge = _check_skill_completion(
+                tool_name, tool_args, skill_map, _completed_skills,
+            )
+            if nudge:
+                return {"additionalContext": nudge}
+
+        # System-reminder reinjection every N tool calls
+        if (
+            skill_map
+            and config.reminder_reinjection_interval > 0
+            and _tool_call_count[0] % config.reminder_reinjection_interval == 0
+        ):
+            reminder = _build_skill_reminder(skill_map, _completed_skills)
+            return {"additionalContext": reminder}
+
         result_text = _stringify_result(tool_result)
         if not result_text:
             return None
@@ -128,8 +235,7 @@ def build_default_hooks(
                 ),
             }
 
-        # Repeat detection for shell commands: warn when the same command
-        # produces the same output multiple times (likely an unfalsifiable loop).
+        # Repeat detection for shell commands
         if tool_name in SHELL_TOOL_NAMES:
             cmd = ""
             if isinstance(input_data.get("toolArgs"), dict):
