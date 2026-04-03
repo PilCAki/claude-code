@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from .config import CopilotCodeConfig, DEFAULT_SKILL_NAMES
+from .extraction import should_extract, build_extraction_prompt
 from .instructions import load_workspace_instructions
 from .memory import MemoryStore
 
@@ -128,6 +129,8 @@ def build_default_hooks(
     _recent_shell: list[tuple[str, str]] = []
     _completed_skills: set[str] = set()
     _tool_call_count = [0]  # mutable counter in list for closure
+    _last_extraction_turn = [0]
+    _total_result_chars = [0]
 
     def on_session_start(_: dict[str, Any], __: dict[str, str]) -> dict[str, Any] | None:
         memory_store.ensure()
@@ -199,6 +202,8 @@ def build_default_hooks(
         tool_result = input_data.get("toolResult")
         _tool_call_count[0] += 1
 
+        result_text = _stringify_result(tool_result)
+
         # Skill-completion detection
         if skill_map:
             nudge = _check_skill_completion(
@@ -206,6 +211,27 @@ def build_default_hooks(
             )
             if nudge:
                 return {"additionalContext": nudge}
+
+        # Track result size for extraction threshold
+        _total_result_chars[0] += len(result_text)
+
+        # Memory extraction check
+        if config.enable_hybrid_memory and should_extract(
+            tool_call_count=_tool_call_count[0],
+            total_chars=_total_result_chars[0],
+            last_extraction_turn=_last_extraction_turn[0],
+            current_turn=_tool_call_count[0],
+            tool_call_interval=config.extraction_tool_call_interval,
+            char_threshold=config.extraction_char_threshold,
+            min_turn_gap=config.extraction_min_turn_gap,
+        ):
+            _last_extraction_turn[0] = _tool_call_count[0]
+            _total_result_chars[0] = 0
+            extraction_prompt = build_extraction_prompt(
+                memory_dir=str(memory_store.memory_dir),
+                project_root=str(memory_store.project_root),
+            )
+            return {"additionalContext": extraction_prompt}
 
         # System-reminder reinjection every N tool calls
         if (
@@ -216,7 +242,6 @@ def build_default_hooks(
             reminder = _build_skill_reminder(skill_map, _completed_skills)
             return {"additionalContext": reminder}
 
-        result_text = _stringify_result(tool_result)
         if not result_text:
             return None
 

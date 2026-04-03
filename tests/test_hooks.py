@@ -320,3 +320,46 @@ def test_post_tool_use_no_reminder_without_skill_map(tmp_path: Path) -> None:
     )
 
     assert result is None
+
+
+def test_post_tool_use_triggers_extraction_at_threshold(tmp_path: Path) -> None:
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extraction_tool_call_interval=3,
+        extraction_min_turn_gap=0,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    hooks = build_default_hooks(config, store)
+
+    for _ in range(2):
+        hooks["on_post_tool_use"](
+            {"toolName": "read", "toolResult": "content"},
+            {},
+        )
+
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "content"},
+        {},
+    )
+
+    assert result is not None
+    assert "memory extraction" in result["additionalContext"].lower()
+
+
+def test_post_tool_use_extraction_respects_min_turn_gap(tmp_path: Path) -> None:
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extraction_tool_call_interval=1,
+        extraction_min_turn_gap=100,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    hooks = build_default_hooks(config, store)
+
+    result = hooks["on_post_tool_use"](
+        {"toolName": "read", "toolResult": "content"},
+        {},
+    )
+
+    assert result is None
