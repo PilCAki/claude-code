@@ -30,3 +30,21 @@ def test_should_extract_respects_custom_min_turn_gap() -> None:
     assert should_extract(
         tool_call_count=20, total_chars=0, last_extraction_turn=12, current_turn=14, min_turn_gap=5,
     ) is False
+
+
+from copilotcode_sdk.extraction import build_extraction_prompt
+
+
+def test_build_extraction_prompt_contains_required_sections() -> None:
+    prompt = build_extraction_prompt(memory_dir="/tmp/mem", project_root="/tmp/project")
+    assert "durable" in prompt.lower()
+    assert "/tmp/mem" in prompt
+    assert "user" in prompt
+    assert "feedback" in prompt
+    assert "project" in prompt
+    assert "reference" in prompt
+
+
+def test_build_extraction_prompt_includes_project_root() -> None:
+    prompt = build_extraction_prompt(memory_dir="/data/mem", project_root="/data/repo")
+    assert "/data/repo" in prompt
