@@ -22,7 +22,6 @@ This repository is configured for CopilotCode, a Python-first layer that brings 
 - When a tool returns a large result, summarize the relevant parts rather than echoing the full output.
 
 ## Verification
-- For non-trivial tasks, keep a short working plan and update it as the approach changes.
 - Verify the result with the narrowest useful tests, scripts, or runtime checks before claiming completion.
 - If the first attempt fails, read the error and adjust instead of blindly retrying the same action.
 - When reviewing or verifying code, prioritize regressions, missing tests, and behavioral risk over stylistic commentary.

@@ -21,6 +21,8 @@ from .prompt_compiler import (
 )
 from .reports import CheckResult, PreflightReport, SmokeTestReport
 from .skill_assets import build_skill_catalog
+from .tasks import TaskStore
+from .task_tools import build_task_tools
 
 if TYPE_CHECKING:
     from copilot import CopilotClient as SDKCopilotClient
@@ -138,6 +140,15 @@ class CopilotCodeClient:
             self.config.memory_home,
             brand=self.config.brand,
         )
+        self._task_store: TaskStore | None = None
+        if self.config.enable_tasks_v2:
+            task_root = (
+                Path(self.config.task_root)
+                if self.config.task_root is not None
+                else self.config.memory_home / "tasks"
+            )
+            persist_path = task_root / "tasks.json"
+            self._task_store = TaskStore(persist_path=persist_path)
         self._client = copilot_client
 
     @property
@@ -147,6 +158,10 @@ class CopilotCodeClient:
     @property
     def memory_store(self) -> MemoryStore:
         return self._memory_store
+
+    @property
+    def task_store(self) -> TaskStore | None:
+        return self._task_store
 
     def build_system_message(self) -> str:
         return build_system_message(self.config)
@@ -291,7 +306,9 @@ class CopilotCodeClient:
             disabled_skills=self._disabled_skills(),
         )
         hooks = build_default_hooks(
-            self.config, self._memory_store, skill_map=skill_map,
+            self.config, self._memory_store,
+            skill_map=skill_map,
+            task_store=self._task_store,
         )
         permission_handler = build_permission_handler(
             policy=self.config.permission_policy,
@@ -334,6 +351,8 @@ class CopilotCodeClient:
         }
         if self.config.model:
             kwargs["model"] = self.config.model
+        if self._task_store is not None:
+            kwargs["tools"] = build_task_tools(self._task_store)
         return {key: value for key, value in kwargs.items() if value is not None}
 
     def _skill_directories(self) -> list[str]:

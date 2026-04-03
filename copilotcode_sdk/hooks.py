@@ -10,6 +10,7 @@ from .config import CopilotCodeConfig, DEFAULT_SKILL_NAMES
 from .extraction import should_extract, build_extraction_prompt
 from .instructions import load_workspace_instructions
 from .memory import MemoryStore
+from .tasks import TaskStore
 
 SUGGESTION_TURN_THRESHOLD = 3
 SUGGESTION_INTERVAL = 15
@@ -140,6 +141,7 @@ def build_default_hooks(
     memory_store: MemoryStore,
     *,
     skill_map: dict[str, dict[str, str]] | None = None,
+    task_store: TaskStore | None = None,
 ) -> dict[str, Any]:
     allowed_roots = tuple(
         path.resolve(strict=False)
@@ -156,6 +158,8 @@ def build_default_hooks(
     _last_extraction_turn = [0]
     _last_suggestion_turn = [0]
     _total_result_chars = [0]
+    _turns_since_task_use = [0]
+    _last_task_reminder_turn = [0]
 
     def on_session_start(_: dict[str, Any], __: dict[str, str]) -> dict[str, Any] | None:
         memory_store.ensure()
@@ -168,6 +172,10 @@ def build_default_hooks(
                 parts.append(instruction_bundle.content)
         if config.enable_hybrid_memory:
             parts.append(memory_store.build_index_context())
+        if task_store is not None:
+            task_summary = task_store.summary_text()
+            if task_summary:
+                parts.append(task_summary)
         return {"additionalContext": "\n\n".join(parts)}
 
     def on_user_prompt_submitted(
@@ -310,6 +318,34 @@ def build_default_hooks(
                         "If the output is actually correct, stop editing and declare success."
                     ),
                 }
+
+        # Track task tool usage for stale-task reminders
+        if tool_name in ("taskcreate", "taskupdate", "tasklist", "taskget"):
+            _turns_since_task_use[0] = 0
+        else:
+            _turns_since_task_use[0] += 1
+
+        # Stale-task reminder
+        if (
+            task_store is not None
+            and config.task_reminder_turns > 0
+            and _turns_since_task_use[0] >= config.task_reminder_turns
+            and _tool_call_count[0] - _last_task_reminder_turn[0] >= config.task_reminder_cooldown_turns
+            and task_store.has_open_tasks()
+        ):
+            _last_task_reminder_turn[0] = _tool_call_count[0]
+            task_summary = task_store.summary_text()
+            return {
+                "additionalContext": (
+                    f"<system-reminder>\n"
+                    f"The task tools haven't been used recently. "
+                    f"You have open tasks — check if any need status updates.\n\n"
+                    f"{task_summary}\n\n"
+                    f"Use TaskUpdate to mark tasks in_progress or completed as appropriate. "
+                    f"Do NOT mention this reminder to the user.\n"
+                    f"</system-reminder>"
+                ),
+            }
 
         # Prompt suggestion: nudge toward available skills
         if (

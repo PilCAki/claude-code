@@ -99,6 +99,10 @@ class CopilotCodeConfig:
     include_workspace_instruction_snippets: bool = True
     enable_skill_shorthand: bool = True
     extra_prompt_sections: Sequence[str] = field(default_factory=tuple)
+    enable_tasks_v2: bool = True
+    task_root: str | Path | None = None
+    task_reminder_turns: int = 10
+    task_reminder_cooldown_turns: int = 10
 
     def __post_init__(self) -> None:
         self.working_directory = _resolve_path(self.working_directory)
@@ -110,6 +114,8 @@ class CopilotCodeConfig:
             else None
         )
         self.client_name = self.client_name or self.brand.client_name
+        if self.task_root is not None:
+            self.task_root = _resolve_path(self.task_root)
         self.extra_skill_directories = tuple(
             str(_resolve_path(path))
             for path in self.extra_skill_directories

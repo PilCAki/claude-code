@@ -73,6 +73,16 @@ def _actions_with_care_rules() -> tuple[str, ...]:
     )
 
 
+def _tool_caveat_rules() -> tuple[str, ...]:
+    return (
+        "Shell tool output (bash, powershell) may strip blank lines, collapse whitespace, or truncate long output. "
+        "Do not treat the captured output as a byte-exact representation of what the program actually wrote to stdout.",
+        "If you need to verify exact output formatting, redirect to a file and read it with a file-reading tool instead of relying on shell capture.",
+        "When shell output looks 'almost right' but has minor formatting differences from what you expect, "
+        "consider that the tool's output capture may be lossy before editing the code.",
+    )
+
+
 def _tone_output_rules() -> tuple[str, ...]:
     return (
         "Be warm, direct, and concise. Collaborate like a helpful teammate rather than a detached tool.",
@@ -84,12 +94,23 @@ def _tone_output_rules() -> tuple[str, ...]:
 
 def _session_guidance() -> tuple[str, ...]:
     return (
-        "For non-trivial tasks, keep a short working plan and update it as the approach changes.",
         "Verify the result with the narrowest useful tests, scripts, or runtime checks before claiming completion.",
         "If the first attempt fails, read the error and adjust instead of blindly retrying the same action.",
         "When reviewing or verifying code, prioritize regressions, missing tests, and behavioral risk over stylistic commentary.",
         "After completing a skill or major phase of work, check the skill catalog for downstream skills that should be triggered next.",
         "Do not stop after completing one skill if downstream skills exist and their prerequisites are now met.",
+    )
+
+
+def _task_guidance() -> tuple[str, ...]:
+    return (
+        "Use TaskCreate to break work into tracked steps when the user gives you a task with 3 or more steps, or for any non-trivial multi-step work.",
+        "Create tasks immediately after receiving new instructions. Do not start work before creating the task list.",
+        "Mark a task in_progress (via TaskUpdate) before you start working on it.",
+        "Mark a task completed immediately when you finish it — do not batch completions.",
+        "After completing a task, use TaskList to find the next available work. Prefer the lowest-ID pending task.",
+        "Use TaskGet before updating a task you haven't touched recently, to check its current state.",
+        "Do not store task-tracking information in memory. Tasks and durable memory serve different purposes.",
     )
 
 
@@ -115,11 +136,14 @@ def build_system_message(
         _intro(cfg),
         _section("Core Operating Rules", _core_operating_rules()),
         _section("Tool Usage Rules", _tool_usage_rules()),
+        _section("Tool Output Caveats", _tool_caveat_rules()),
         _section("Output Efficiency", _output_efficiency_rules()),
         _section("Actions With Care", _actions_with_care_rules()),
         _section("Tone And Output", _tone_output_rules()),
         _section("Session Guidance", _session_guidance()),
     ]
+    if cfg.enable_tasks_v2:
+        sections.append(_section("Task Management", _task_guidance()))
     if skill_directories:
         catalog_text, _ = build_skill_catalog(
             skill_directories,

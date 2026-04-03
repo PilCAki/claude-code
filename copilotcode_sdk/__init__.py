@@ -17,6 +17,8 @@ from .compaction import build_compaction_prompt, build_handoff_context
 from .instructions import InstructionBundle, load_workspace_instructions
 from .reports import CheckResult, PreflightReport, SmokeTestReport
 from .skill_assets import build_skill_catalog, parse_skill_frontmatter
+from .tasks import TaskRecord, TaskStatus, TaskStore
+from .task_tools import build_task_tools
 
 __all__ = [
     "BrandSpec",
@@ -32,11 +34,15 @@ __all__ = [
     "PermissionPolicy",
     "PreflightReport",
     "SmokeTestReport",
+    "TaskRecord",
+    "TaskStatus",
+    "TaskStore",
     "build_compaction_prompt",
     "build_default_custom_agents",
     "build_extraction_prompt",
     "build_handoff_context",
     "build_skill_catalog",
+    "build_task_tools",
     "build_system_message",
     "load_workspace_instructions",
     "materialize_workspace_instructions",
