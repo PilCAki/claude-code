@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from .config import CopilotCodeConfig, DEFAULT_SKILL_NAMES
-from .extraction import should_extract, build_extraction_prompt
+from .extraction import should_extract, build_extraction_prompt, build_session_end_extraction_prompt
 from .instructions import load_workspace_instructions
 from .memory import MemoryStore
 from .tasks import TaskStore
@@ -176,6 +176,12 @@ def build_default_hooks(
             task_summary = task_store.summary_text()
             if task_summary:
                 parts.append(task_summary)
+
+        # Detect prior-run artifacts in outputs/
+        prior_context = _build_prior_artifact_context(config.working_path)
+        if prior_context:
+            parts.append(prior_context)
+
         return {"additionalContext": "\n\n".join(parts)}
 
     def on_user_prompt_submitted(
@@ -243,6 +249,14 @@ def build_default_hooks(
                 tool_name, tool_args, skill_map, _completed_skills,
             )
             if nudge:
+                # Session-end extraction when all skills are done
+                all_done = len(_completed_skills) >= len(skill_map)
+                if all_done and config.enable_hybrid_memory:
+                    end_prompt = build_session_end_extraction_prompt(
+                        memory_dir=str(memory_store.memory_dir),
+                        project_root=str(memory_store.project_root),
+                    )
+                    nudge = nudge + "\n\n" + end_prompt
                 return {"additionalContext": nudge}
 
         # Track result size for extraction threshold
@@ -477,3 +491,34 @@ def _tool_result_failed(result: Any) -> bool:
         if result.get("error"):
             return True
     return False
+
+
+def _build_prior_artifact_context(working_directory: Path) -> str:
+    """Read canonical carry-forward files from outputs/ and format a summary."""
+    outputs = working_directory / "outputs"
+    prior_metrics = outputs / "prior_run_metrics.json"
+    column_mapping = outputs / "column_mapping.json"
+
+    if not prior_metrics.exists() and not column_mapping.exists():
+        return ""
+
+    lines = [
+        "## Prior Analysis Artifacts",
+        "The following artifacts from a prior analysis were found in `outputs/`:",
+    ]
+
+    if prior_metrics.exists():
+        lines.append("- `prior_run_metrics.json` — verified metrics from a prior run")
+        try:
+            data = json.loads(prior_metrics.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for key, value in list(data.items())[:8]:
+                    if isinstance(value, (int, float)) and value is not None:
+                        lines.append(f"  - {key}: {value}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if column_mapping.exists():
+        lines.append("- `column_mapping.json` — canonical column name mapping from a prior run")
+
+    return "\n".join(lines)

@@ -117,11 +117,34 @@ def _task_guidance() -> tuple[str, ...]:
 def _memory_guidance(config: CopilotCodeConfig) -> tuple[str, ...]:
     memory_dir = f"~/{config.brand.app_dirname}/projects/<project>/memory"
     return (
-        f"A durable file-based memory store lives under `{memory_dir}`.",
-        "`MEMORY.md` is an index of concise pointers, not a dump of full memory content.",
-        "Store only durable context that will matter across sessions: user preferences, stable repo conventions, durable feedback, and reference notes.",
-        "Do not store transient TODOs, one-off debugging facts, or information that can be re-derived cheaply from the repository.",
-        "When the user asks you to remember something, create or update the most relevant topic file and keep the index in sync.",
+        # Core directive
+        f"You have a persistent, file-based memory system at `{memory_dir}`. "
+        "Build it up over time so future sessions have a complete picture of the project, "
+        "user preferences, and context behind the work.",
+
+        # How to save
+        "To save a memory, write a `.md` file with `---` frontmatter (name, description, type) "
+        "to the memory directory. Add a one-line pointer to `MEMORY.md`. One file per topic, not per session. "
+        "Update existing memories rather than creating duplicates.",
+
+        # Proactive saving rule
+        "If you learn something durable, save it immediately as part of your normal workflow — "
+        "do not wait for a reminder or checkpoint. Saving a memory is a 10-second action; "
+        "losing context across sessions is expensive.",
+
+        # Memory types with triggers
+        "**Memory types and when to save:**\n"
+        "- **user** — save when you learn the user's role, preferences, expertise, or how they want to collaborate.\n"
+        "- **feedback** — save when the user corrects your approach OR confirms a non-obvious approach worked. "
+        "Corrections are easy to notice; confirmations are quieter — watch for them.\n"
+        "- **project** — save when you discover data structure, schema relationships, column meanings, "
+        "data quality characteristics, key metrics, or decisions that aren't documented elsewhere. "
+        "Also save when you learn who is doing what, why, or by when.\n"
+        "- **reference** — save when you learn about external resources, dashboards, tracking systems, or documentation.",
+
+        # What NOT to save
+        "**Do not save:** code patterns derivable from reading the code, git history (`git log` is authoritative), "
+        "debugging solutions (the fix is in the code), anything already in CLAUDE.md, or ephemeral task details.",
     )
 
 

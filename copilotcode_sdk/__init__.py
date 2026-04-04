@@ -12,7 +12,7 @@ from .prompt_compiler import (
     render_claude_md_template,
     render_copilot_instructions_template,
 )
-from .extraction import build_extraction_prompt, should_extract
+from .extraction import build_extraction_prompt, build_session_end_extraction_prompt, should_extract
 from .compaction import build_compaction_prompt, build_handoff_context
 from .instructions import InstructionBundle, load_workspace_instructions
 from .reports import CheckResult, PreflightReport, SmokeTestReport
@@ -40,6 +40,7 @@ __all__ = [
     "build_compaction_prompt",
     "build_default_custom_agents",
     "build_extraction_prompt",
+    "build_session_end_extraction_prompt",
     "build_handoff_context",
     "build_skill_catalog",
     "build_task_tools",

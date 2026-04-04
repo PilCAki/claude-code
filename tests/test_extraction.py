@@ -37,14 +37,36 @@ from copilotcode_sdk.extraction import build_extraction_prompt
 
 def test_build_extraction_prompt_contains_required_sections() -> None:
     prompt = build_extraction_prompt(memory_dir="/tmp/mem", project_root="/tmp/project")
-    assert "durable" in prompt.lower()
+    assert "checkpoint" in prompt.lower()
     assert "/tmp/mem" in prompt
-    assert "user" in prompt
-    assert "feedback" in prompt
-    assert "project" in prompt
-    assert "reference" in prompt
+    assert "/tmp/project" in prompt
+    assert "MEMORY.md" in prompt
+    # Should NOT contain opt-out language
+    assert "that is fine" not in prompt
+    assert "do not force" not in prompt
 
 
 def test_build_extraction_prompt_includes_project_root() -> None:
     prompt = build_extraction_prompt(memory_dir="/data/mem", project_root="/data/repo")
     assert "/data/repo" in prompt
+
+
+from copilotcode_sdk.extraction import build_session_end_extraction_prompt
+
+
+def test_build_session_end_extraction_prompt_is_urgent() -> None:
+    prompt = build_session_end_extraction_prompt(memory_dir="/tmp/mem", project_root="/tmp/project")
+    assert "/tmp/mem" in prompt
+    assert "/tmp/project" in prompt
+    assert "complete" in prompt.lower()
+    assert "at least one" in prompt.lower()
+    # Should NOT contain opt-out language
+    assert "that is fine" not in prompt
+
+
+def test_build_session_end_extraction_prompt_lists_what_to_capture() -> None:
+    prompt = build_session_end_extraction_prompt(memory_dir="/m", project_root="/p")
+    assert "schema" in prompt.lower()
+    assert "column" in prompt.lower()
+    assert "data quality" in prompt.lower()
+    assert "metrics" in prompt.lower()

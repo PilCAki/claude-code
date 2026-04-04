@@ -115,6 +115,22 @@ class TestTaskUpdate:
         result = _call(tools, "TaskUpdate", {"task_id": 1, "status": "completed"})
         assert "All tasks complete" in result.text_result_for_llm
 
+    def test_update_status_alias_done(self, tools, store):
+        store.create("X")
+        result = _call(tools, "TaskUpdate", {"task_id": 1, "status": "done"})
+        assert store.get(1).status == TaskStatus.completed
+
+    def test_update_status_alias_started(self, tools, store):
+        store.create("X")
+        result = _call(tools, "TaskUpdate", {"task_id": 1, "status": "started"})
+        assert store.get(1).status == TaskStatus.in_progress
+
+    def test_update_status_alias_todo(self, tools, store):
+        store.create("X")
+        store.update(1, status="in_progress")
+        result = _call(tools, "TaskUpdate", {"task_id": 1, "status": "todo"})
+        assert store.get(1).status == TaskStatus.pending
+
     def test_update_invalid_status(self, tools, store):
         store.create("X")
         result = _call(tools, "TaskUpdate", {"task_id": 1, "status": "bogus"})

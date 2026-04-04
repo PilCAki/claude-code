@@ -344,7 +344,7 @@ def test_post_tool_use_triggers_extraction_at_threshold(tmp_path: Path) -> None:
     )
 
     assert result is not None
-    assert "memory extraction" in result["additionalContext"].lower()
+    assert "memory" in result["additionalContext"].lower()
 
 
 def test_post_tool_use_extraction_respects_min_turn_gap(tmp_path: Path) -> None:
@@ -438,3 +438,76 @@ def test_post_tool_use_no_suggestion_before_threshold(tmp_path: Path) -> None:
     )
 
     assert result is None
+
+
+import json
+
+
+def test_session_start_injects_prior_artifact_context(tmp_path: Path) -> None:
+    """When prior_run_metrics.json exists in outputs/, session start should surface it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    metrics = {"total_claims": 5000, "realization_rate": 0.42}
+    (outputs / "prior_run_metrics.json").write_text(
+        json.dumps(metrics), encoding="utf-8",
+    )
+    (outputs / "column_mapping.json").write_text(
+        json.dumps({"Charge": "billed_charge"}), encoding="utf-8",
+    )
+
+    _, _, hooks = _build_hooks(tmp_path)
+
+    result = hooks["on_session_start"]({}, {})
+    ctx = result["additionalContext"]
+
+    assert "prior_run_metrics.json" in ctx
+    assert "column_mapping.json" in ctx
+    assert "total_claims" in ctx
+    assert "5000" in ctx
+
+
+def test_session_start_no_prior_artifacts_when_outputs_empty(tmp_path: Path) -> None:
+    """When no carry-forward files exist, no prior artifact section is injected."""
+    _, _, hooks = _build_hooks(tmp_path)
+
+    result = hooks["on_session_start"]({}, {})
+    ctx = result["additionalContext"]
+
+    assert "Prior Analysis Artifacts" not in ctx
+
+
+def test_post_tool_use_session_end_extraction_when_all_skills_done(tmp_path: Path) -> None:
+    """When the last skill completes, session-end extraction prompt should fire."""
+    skill_dir = tmp_path / "skills" / "only-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: only-skill\ndescription: Solo.\ntype: solo\n"
+        "outputs: outputs/solo/\nrequires: none\n---\n\n# Solo\n",
+        encoding="utf-8",
+    )
+
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+        extraction_tool_call_interval=999,
+        extraction_min_turn_gap=999,
+        reminder_reinjection_interval=0,
+    )
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    _, skill_map = build_skill_catalog([str(tmp_path / "skills")])
+    hooks = build_default_hooks(config, store, skill_map=skill_map)
+
+    # Write to the skill's output path → triggers skill completion
+    result = hooks["on_post_tool_use"](
+        {
+            "toolName": "write_file",
+            "toolArgs": {"path": str(tmp_path / "outputs" / "solo" / "result.json")},
+            "toolResult": "File written.",
+        },
+        {},
+    )
+
+    assert result is not None
+    ctx = result["additionalContext"]
+    assert "only-skill" in ctx  # skill completion nudge
+    assert "final memory checkpoint" in ctx.lower()  # session-end extraction

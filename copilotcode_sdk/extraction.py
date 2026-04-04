@@ -25,19 +25,41 @@ def should_extract(
 
 
 def build_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
+    """Periodic backstop reminder to save durable learnings.
+
+    The system prompt already contains standing instructions for proactive
+    memory saving.  This fires as a periodic nudge for agents that forget.
+    """
     return (
-        "**Session memory extraction checkpoint.** "
-        "Review what you have learned in this session so far and save any durable "
-        "learnings to the memory system. Durable learnings are facts, preferences, "
-        "or context that would be valuable in future conversations about this project.\n\n"
-        "Memory types to consider:\n"
-        "- **user**: Role, preferences, expertise level\n"
-        "- **feedback**: Corrections or confirmed approaches\n"
-        "- **project**: Ongoing work, goals, decisions, timelines\n"
-        "- **reference**: Pointers to external resources\n\n"
+        "**Memory checkpoint.** Review what you have learned in this session. "
+        "If you discovered anything durable about this project — data structure, "
+        "column meanings, schema relationships, data quality issues, key decisions, "
+        "user preferences — save it to memory now.\n\n"
         f"Memory directory: `{memory_dir}`\n"
         f"Project root: `{project_root}`\n\n"
-        "Only save things that are not already derivable from the code or git history. "
-        "Skip ephemeral task details. If you have nothing durable to save, that is fine — "
-        "do not force it. Continue with your current work after this checkpoint."
+        "Write a `.md` file with frontmatter (name, description, type) and add a "
+        "pointer to `MEMORY.md`. Refer to the Memory Guidance section of your "
+        "instructions for memory types and format. Continue with your current "
+        "work after saving."
+    )
+
+
+def build_session_end_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
+    """Urgent extraction prompt fired when all skills are complete.
+
+    This is the last chance to persist learnings before the session ends.
+    """
+    return (
+        "**All skills are complete — final memory checkpoint.** Before this session "
+        "ends, save any durable learnings you have not yet persisted. Key things "
+        "to capture:\n"
+        "- Schema structure and column interpretations\n"
+        "- Data quality findings (nulls, duplicates, unexpected values)\n"
+        "- Key metrics you computed and verified\n"
+        "- Decisions or assumptions a future session should know about\n"
+        "- File paths and formats of important artifacts produced\n\n"
+        f"Memory directory: `{memory_dir}`\n"
+        f"Project root: `{project_root}`\n\n"
+        "Write at least one memory file. Future sessions on this project will "
+        "benefit from what you learned today."
     )

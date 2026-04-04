@@ -16,6 +16,7 @@ from .config import CopilotCodeConfig
 from .memory import MemoryStore
 from .prompt_compiler import materialize_workspace_instructions
 from .reports import ValidationPhaseReport, ValidationReport
+from .tasks import TaskStore
 
 PYTEST_TIMEOUT_SECONDS = 900
 
@@ -135,6 +136,38 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_config_arguments(memory_reindex_parser)
     memory_reindex_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     memory_reindex_parser.set_defaults(func=_run_memory_reindex)
+
+    # -- tasks subcommand --
+    tasks_parser = subparsers.add_parser(
+        "tasks",
+        help="Inspect or manage CopilotCode task tracking.",
+    )
+    tasks_subparsers = tasks_parser.add_subparsers(dest="tasks_command", required=True)
+
+    tasks_list_parser = tasks_subparsers.add_parser(
+        "list",
+        help="List all open tasks for the current workspace.",
+    )
+    _add_common_config_arguments(tasks_list_parser)
+    tasks_list_parser.add_argument("--all", action="store_true", help="Include completed and deleted tasks.")
+    tasks_list_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    tasks_list_parser.set_defaults(func=_run_tasks_list)
+
+    tasks_get_parser = tasks_subparsers.add_parser(
+        "get",
+        help="Get details for a specific task by ID.",
+    )
+    _add_common_config_arguments(tasks_get_parser)
+    tasks_get_parser.add_argument("task_id", type=int, help="The task ID to retrieve.")
+    tasks_get_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    tasks_get_parser.set_defaults(func=_run_tasks_get)
+
+    tasks_clear_parser = tasks_subparsers.add_parser(
+        "clear",
+        help="Delete the task store file for the current workspace.",
+    )
+    _add_common_config_arguments(tasks_clear_parser)
+    tasks_clear_parser.set_defaults(func=_run_tasks_clear)
 
     return parser
 
@@ -304,6 +337,66 @@ def _run_memory_reindex(args: argparse.Namespace) -> int:
         "entries": [line for line in index_content.splitlines() if line.strip()],
     }
     _emit_report(payload, f"Reindexed {store.index_path}", as_json=args.json)
+    return 0
+
+
+def _task_store_from_args(args: argparse.Namespace) -> TaskStore:
+    config = _config_from_args(args)
+    task_root = config.memory_home / "tasks"
+    return TaskStore(persist_path=task_root / "tasks.json")
+
+
+def _run_tasks_list(args: argparse.Namespace) -> int:
+    store = _task_store_from_args(args)
+    tasks = store.list_all() if args.all else store.list_open()
+
+    if args.json:
+        print(json.dumps([t.to_dict() for t in tasks], indent=2))
+        return 0
+
+    if not tasks:
+        print("No tasks found.")
+        return 0
+
+    for t in tasks:
+        status = t.status.value.replace("_", " ")
+        owner = f" (owner: {t.owner})" if t.owner else ""
+        print(f"#{t.id} [{status}]{owner}: {t.subject}")
+        if t.description:
+            print(f"    {t.description}")
+    return 0
+
+
+def _run_tasks_get(args: argparse.Namespace) -> int:
+    store = _task_store_from_args(args)
+    task = store.get(args.task_id)
+    if task is None:
+        print(f"Task #{args.task_id} not found.")
+        return 1
+
+    if args.json:
+        print(json.dumps(task.to_dict(), indent=2))
+        return 0
+
+    status = task.status.value.replace("_", " ")
+    print(f"Task #{task.id}: {task.subject}")
+    print(f"  Status:      {status}")
+    if task.owner:
+        print(f"  Owner:       {task.owner}")
+    if task.description:
+        print(f"  Description: {task.description}")
+    if task.metadata:
+        print(f"  Metadata:    {json.dumps(task.metadata)}")
+    return 0
+
+
+def _run_tasks_clear(args: argparse.Namespace) -> int:
+    store = _task_store_from_args(args)
+    if store.persist_path and store.persist_path.exists():
+        store.persist_path.unlink()
+        print(f"Deleted {store.persist_path}")
+    else:
+        print("No task store file found.")
     return 0
 
 

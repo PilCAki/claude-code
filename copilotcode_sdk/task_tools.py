@@ -64,6 +64,9 @@ def build_task_tools(store: TaskStore) -> list[Any]:
 
         status = args.get("status")
         if status is not None:
+            # Accept common aliases
+            status_aliases = {"done": "completed", "started": "in_progress", "todo": "pending"}
+            status = status_aliases.get(status, status)
             try:
                 TaskStatus(status)
             except ValueError:
