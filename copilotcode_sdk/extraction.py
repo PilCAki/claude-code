@@ -29,6 +29,7 @@ def build_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
 
     The system prompt already contains standing instructions for proactive
     memory saving.  This fires as a periodic nudge for agents that forget.
+    Includes a concrete example to remove ambiguity about the mechanics.
     """
     return (
         "**Memory checkpoint.** Review what you have learned in this session. "
@@ -37,10 +38,21 @@ def build_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
         "user preferences — save it to memory now.\n\n"
         f"Memory directory: `{memory_dir}`\n"
         f"Project root: `{project_root}`\n\n"
-        "Write a `.md` file with frontmatter (name, description, type) and add a "
-        "pointer to `MEMORY.md`. Refer to the Memory Guidance section of your "
-        "instructions for memory types and format. Continue with your current "
-        "work after saving."
+        "For example, if you learned that the dataset has 166K rows of claims data "
+        "with a 37% realization rate, you would:\n\n"
+        f"1. Write `{memory_dir}/project_dataset_structure.md`:\n"
+        "```markdown\n"
+        "---\n"
+        "name: Dataset structure\n"
+        "description: eCW claims dataset — 166K rows, key columns, realization rate\n"
+        "type: project\n"
+        "---\n\n"
+        "The eCW transactions dataset contains ~166K claim line items...\n"
+        "```\n\n"
+        "2. Add to `MEMORY.md`: `- [Dataset structure](project_dataset_structure.md) "
+        "— eCW claims: 166K rows, 37% realization rate`\n\n"
+        "Refer to the auto memory section of your instructions for memory types "
+        "and format. Continue with your current work after saving."
     )
 
 

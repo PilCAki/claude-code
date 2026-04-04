@@ -25,7 +25,7 @@ def test_build_system_message_includes_expected_sections(tmp_path: Path) -> None
     assert "# CopilotCode" in message
     assert "## Core Operating Rules" in message
     assert "## Tool Usage Rules" in message
-    assert "## Memory Guidance" in message
+    assert "# auto memory" in message
     assert "prompt-injection" in message
 
 
@@ -38,7 +38,7 @@ def test_build_system_message_can_disable_memory(tmp_path: Path) -> None:
 
     message = build_system_message(config)
 
-    assert "## Memory Guidance" not in message
+    assert "# auto memory" not in message
 
 
 def test_templates_reference_copilotcode_branding(tmp_path: Path) -> None:
@@ -177,7 +177,32 @@ def test_build_system_message_section_order(tmp_path: Path) -> None:
         "## Actions With Care",
         "## Tone And Output",
         "## Session Guidance",
-        "## Memory Guidance",
+        "# auto memory",
     ]
     positions = [message.index(s) for s in sections]
     assert positions == sorted(positions), f"Sections out of order: {positions}"
+
+
+def test_build_system_message_memory_has_examples_and_template(tmp_path: Path) -> None:
+    """Memory guidance must include concrete examples and the frontmatter template."""
+    config = CopilotCodeConfig(
+        working_directory=tmp_path,
+        memory_root=tmp_path / ".mem",
+    )
+    message = build_system_message(config)
+
+    # Concrete examples showing user→assistant save pattern
+    assert "[saves" in message
+    # Frontmatter template with --- fences
+    assert "---\nname:" in message
+    # Two-step save process
+    assert "Step 1" in message
+    assert "Step 2" in message
+    # MEMORY.md format guidance
+    assert "~150 characters" in message
+    # All four memory types
+    for t in ("### user", "### feedback", "### project", "### reference"):
+        assert t in message
+    # Body structure guidance for feedback/project
+    assert "**Why:**" in message
+    assert "**How to apply:**" in message

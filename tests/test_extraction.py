@@ -44,6 +44,9 @@ def test_build_extraction_prompt_contains_required_sections() -> None:
     # Should NOT contain opt-out language
     assert "that is fine" not in prompt
     assert "do not force" not in prompt
+    # Should contain inline example with frontmatter
+    assert "---\nname:" in prompt
+    assert "type: project" in prompt
 
 
 def test_build_extraction_prompt_includes_project_root() -> None:

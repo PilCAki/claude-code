@@ -30,11 +30,4 @@ This repository is configured for CopilotCode, a Python-first layer that brings 
 
 ## Memory
 - You have a persistent, file-based memory system at `~/.copilotcode/projects/<project>/memory`. Build it up over time so future sessions have a complete picture of the project, user preferences, and context behind the work.
-- To save a memory, write a `.md` file with `---` frontmatter (name, description, type) to the memory directory. Add a one-line pointer to `MEMORY.md`. One file per topic, not per session. Update existing memories rather than creating duplicates.
-- If you learn something durable, save it immediately as part of your normal workflow — do not wait for a reminder or checkpoint. Saving a memory is a 10-second action; losing context across sessions is expensive.
-- **Memory types and when to save:**
-- **user** — save when you learn the user's role, preferences, expertise, or how they want to collaborate.
-- **feedback** — save when the user corrects your approach OR confirms a non-obvious approach worked. Corrections are easy to notice; confirmations are quieter — watch for them.
-- **project** — save when you discover data structure, schema relationships, column meanings, data quality characteristics, key metrics, or decisions that aren't documented elsewhere. Also save when you learn who is doing what, why, or by when.
-- **reference** — save when you learn about external resources, dashboards, tracking systems, or documentation.
-- **Do not save:** code patterns derivable from reading the code, git history (`git log` is authoritative), debugging solutions (the fix is in the code), anything already in CLAUDE.md, or ephemeral task details.
+- Refer to the auto memory section of the system prompt for full instructions on memory types, format, and when to save.
