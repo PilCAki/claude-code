@@ -114,8 +114,9 @@ def _task_guidance() -> tuple[str, ...]:
     )
 
 
-def _memory_guidance(config: CopilotCodeConfig) -> tuple[str, ...]:
-    memory_dir = f"~/{config.brand.app_dirname}/projects/<project>/memory"
+def _memory_guidance(config: CopilotCodeConfig, memory_dir: str | None = None) -> tuple[str, ...]:
+    if memory_dir is None:
+        memory_dir = f"~/{config.brand.app_dirname}/projects/<project>/memory"
     return (
         # Core directive
         f"You have a persistent, file-based memory system at `{memory_dir}`. "
@@ -153,6 +154,7 @@ def build_system_message(
     *,
     skill_directories: Sequence[str] | None = None,
     disabled_skills: Sequence[str] | None = None,
+    memory_dir: str | None = None,
 ) -> str:
     cfg = config or CopilotCodeConfig()
     sections = [
@@ -175,7 +177,7 @@ def build_system_message(
         if catalog_text:
             sections.append(catalog_text)
     if cfg.enable_hybrid_memory:
-        sections.append(_section("Memory Guidance", _memory_guidance(cfg)))
+        sections.append(_section("Memory Guidance", _memory_guidance(cfg, memory_dir=memory_dir)))
     if cfg.extra_prompt_sections:
         sections.extend(cfg.extra_prompt_sections)
     return "\n\n".join(sections).strip()

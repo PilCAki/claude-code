@@ -331,6 +331,7 @@ class CopilotCodeClient:
                     self.config,
                     skill_directories=self._skill_directories(),
                     disabled_skills=self._disabled_skills(),
+                    memory_dir=str(self._memory_store.memory_dir),
                 ),
             },
             "on_user_input_request": self.config.user_input_handler,
