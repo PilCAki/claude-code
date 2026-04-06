@@ -211,10 +211,8 @@ def _build_skill_user_prompt(
         "1. Follow the skill methodology above step by step.",
         "2. Write all outputs to the paths specified in the skill definition.",
         "3. Verify your outputs match the quality rubric before finishing.",
-        '4. When done, you MUST call CompleteSkill(skill="<name>", source_file="<file>", '
-        'output_summary="<what you produced>", row_count=<N>).',
-        "   This is required — without it, downstream skills will be blocked.",
-        "   Do NOT call CompleteSkill until you have verified your outputs exist and are correct.",
+        "4. Do NOT call CompleteSkill or InvokeSkill — verification and completion",
+        "   are handled automatically after you finish.",
     ])
 
     return "\n".join(parts)
@@ -337,69 +335,7 @@ def build_skill_tool(
         if session_holder and len(session_holder) > 0:
             session = session_holder[0]
 
-        if session is not None:
-            _skill_logger.info(
-                "FORK %s — spawning child agent to execute skill", skill_name,
-            )
-            start_time = time.time()
-            try:
-                from .subagent import SubagentSpec
-                # Child gets all tools EXCEPT InvokeSkill — prevents deep
-                # chaining.  CompleteSkill is included so the child can
-                # trigger verification and handle retry loops itself.
-                spec = SubagentSpec(
-                    role=f"skill:{skill_name}",
-                    system_prompt_suffix="",  # child gets SKILL.md via user prompt
-                    max_turns=50,
-                    timeout_seconds=1800.0,  # 30 minutes per skill
-                )
-                child = await session.fork_child(spec)
-                try:
-                    raw_result = await child.send_and_wait(
-                        user_prompt, timeout=1800.0,
-                    )
-                    if not isinstance(raw_result, str):
-                        raw_result = str(raw_result)
-                finally:
-                    await child.destroy()
-
-                elapsed = round(time.time() - start_time, 1)
-                _skill_logger.info(
-                    "FORK %s — child completed in %.1fs (%d chars output)",
-                    skill_name, elapsed, len(raw_result),
-                )
-
-                # Return the child's result to the orchestrator
-                return ToolResult(
-                    text_result_for_llm=json.dumps({
-                        "status": "skill_complete",
-                        "skill_name": skill_name,
-                        "skill_type": fm.get("type", ""),
-                        "outputs": fm.get("outputs", ""),
-                        "elapsed_seconds": elapsed,
-                        "result_summary": raw_result[:2000],
-                    }),
-                )
-            except Exception as exc:
-                # Let VerificationExhaustedError bubble up to kill the session
-                from .verifier import VerificationExhaustedError as _VEE
-                if isinstance(exc, _VEE):
-                    raise
-                elapsed = round(time.time() - start_time, 1)
-                _skill_logger.error(
-                    "FORK %s — child failed after %.1fs: %s",
-                    skill_name, elapsed, exc,
-                )
-                return ToolResult(
-                    text_result_for_llm=(
-                        f"Error: skill '{skill_name}' child agent failed after "
-                        f"{elapsed}s: {exc}. Review the error and try again."
-                    ),
-                    result_type="error",
-                )
-        else:
-            # No session available — return metadata (fallback, should not
-            # happen in normal operation)
+        if session is None:
             _skill_logger.warning(
                 "NO SESSION for InvokeSkill(%s) — returning metadata only, "
                 "no child agent will be forked!", skill_name,
@@ -415,6 +351,196 @@ def build_skill_tool(
                     "warning": "No session available — skill was NOT executed by a child agent.",
                 }),
             )
+
+        # --- Fork → verify → retry loop (all enforced by code) ---
+        from .subagent import SubagentSpec
+        from .verifier import (
+            MAX_VERIFICATION_ATTEMPTS,
+            MAX_VERIFIER_MALFUNCTIONS,
+            VerificationExhaustedError,
+            format_fail_feedback,
+            run_verification,
+            write_failure_trace,
+        )
+
+        outputs_rel = fm.get("outputs", "").strip()
+        verify_output_dir = (
+            Path(working_directory) / outputs_rel if outputs_rel
+            else Path(working_directory)
+        )
+
+        # Read prior metrics for the verifier
+        prior_metrics: str | None = None
+        metrics_path = Path(working_directory) / "prior_run_metrics.json"
+        if metrics_path.is_file():
+            try:
+                prior_metrics = metrics_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        attempt_counts = 0
+        malfunction_counts = 0
+        attempt_history: list[dict[str, Any]] = []
+        total_start = time.time()
+
+        # Fork child ONCE — keep alive for the entire verify/fix cycle
+        _skill_logger.info("FORK %s — spawning child agent", skill_name)
+        try:
+            spec = SubagentSpec(
+                role=f"skill:{skill_name}",
+                system_prompt_suffix="",
+                max_turns=100,  # generous — child may need many turns across retries
+                timeout_seconds=3600.0,  # 1 hour total for skill + retries
+            )
+            child = await session.fork_child(spec)
+        except Exception as exc:
+            _skill_logger.error("FORK %s — spawn failed: %s", skill_name, exc)
+            return ToolResult(
+                text_result_for_llm=f"Error: could not fork child for '{skill_name}': {exc}",
+                result_type="error",
+            )
+
+        try:
+            # --- Initial work ---
+            _skill_logger.info("FORK %s — child starting work", skill_name)
+            raw_result = await child.send_and_wait(user_prompt, timeout=1800.0)
+            if not isinstance(raw_result, str):
+                raw_result = str(raw_result)
+            _skill_logger.info(
+                "FORK %s — child finished initial work (%d chars)",
+                skill_name, len(raw_result),
+            )
+
+            # --- Verify/fix loop ---
+            max_loops = MAX_VERIFICATION_ATTEMPTS + MAX_VERIFIER_MALFUNCTIONS + 3
+            for loop_idx in range(max_loops):
+                # Check output dir has real content
+                if outputs_rel:
+                    if not verify_output_dir.exists():
+                        _skill_logger.warning(
+                            "GATE %s: output dir '%s' missing", skill_name, outputs_rel,
+                        )
+                        attempt_counts += 1
+                        if attempt_counts >= MAX_VERIFICATION_ATTEMPTS:
+                            trace_path = write_failure_trace(
+                                skill_name, attempt_history, verify_output_dir,
+                                Path(working_directory),
+                            )
+                            raise VerificationExhaustedError(skill_name, trace_path)
+                        # Send feedback to SAME child
+                        raw_result = await child.send_and_wait(
+                            f"Output directory '{outputs_rel}' does not exist. "
+                            f"You must write outputs to this directory. Fix this now.",
+                            timeout=1800.0,
+                        )
+                        continue
+
+                    total_bytes = sum(
+                        f.stat().st_size for f in verify_output_dir.rglob("*")
+                        if f.is_file()
+                    )
+                    if total_bytes < MIN_OUTPUT_BYTES:
+                        _skill_logger.warning(
+                            "GATE %s: output dir has only %d bytes", skill_name, total_bytes,
+                        )
+                        attempt_counts += 1
+                        if attempt_counts >= MAX_VERIFICATION_ATTEMPTS:
+                            trace_path = write_failure_trace(
+                                skill_name, attempt_history, verify_output_dir,
+                                Path(working_directory),
+                            )
+                            raise VerificationExhaustedError(skill_name, trace_path)
+                        raw_result = await child.send_and_wait(
+                            f"Output directory '{outputs_rel}' has only {total_bytes} "
+                            f"bytes — this looks like placeholders. Write real outputs.",
+                            timeout=1800.0,
+                        )
+                        continue
+
+                # Run verification
+                current_attempt = attempt_counts + 1
+                vresult = await run_verification(
+                    skill_name=skill_name,
+                    skill_content=skill_content,
+                    output_dir=verify_output_dir,
+                    workspace=Path(working_directory),
+                    fork_child=session.fork_child,
+                    prior_metrics=prior_metrics,
+                    attempt_num=current_attempt,
+                )
+
+                if vresult.passed:
+                    _skill_logger.info("PASS %s — verification passed", skill_name)
+                    completed_skills.add(skill_name)
+                    total_elapsed = round(time.time() - total_start, 1)
+                    return ToolResult(
+                        text_result_for_llm=json.dumps({
+                            "status": "skill_complete",
+                            "skill_name": skill_name,
+                            "skill_type": fm.get("type", ""),
+                            "outputs": outputs_rel,
+                            "elapsed_seconds": total_elapsed,
+                            "result_summary": raw_result[:2000] if isinstance(raw_result, str) else "",
+                        }),
+                    )
+                elif vresult.is_malfunction:
+                    malfunction_counts += 1
+                    attempt_history.append({
+                        "verdict": "MALFUNCTION",
+                        "raw_output": vresult.raw_output,
+                        "timestamp": time.time(),
+                    })
+                    if malfunction_counts >= MAX_VERIFIER_MALFUNCTIONS + 1:
+                        attempt_counts += 1
+                        malfunction_counts = 0
+                        if attempt_counts >= MAX_VERIFICATION_ATTEMPTS:
+                            trace_path = write_failure_trace(
+                                skill_name, attempt_history, verify_output_dir,
+                                Path(working_directory),
+                            )
+                            raise VerificationExhaustedError(skill_name, trace_path)
+                    # Re-run verification only (malfunction is verifier's fault)
+                    continue
+                else:
+                    # FAIL or PARTIAL — send feedback to same child
+                    attempt_counts += 1
+                    malfunction_counts = 0
+                    attempt_history.append({
+                        "verdict": vresult.verdict,
+                        "failed_checks": vresult.failed_checks,
+                        "raw_output": vresult.raw_output,
+                        "timestamp": time.time(),
+                    })
+                    if attempt_counts >= MAX_VERIFICATION_ATTEMPTS:
+                        trace_path = write_failure_trace(
+                            skill_name, attempt_history, verify_output_dir,
+                            Path(working_directory),
+                        )
+                        raise VerificationExhaustedError(skill_name, trace_path)
+                    feedback = format_fail_feedback(
+                        vresult.failed_checks, attempt_counts,
+                        MAX_VERIFICATION_ATTEMPTS,
+                    )
+                    _skill_logger.info(
+                        "FAIL %s attempt %d — sending feedback to child",
+                        skill_name, attempt_counts,
+                    )
+                    raw_result = await child.send_and_wait(
+                        f"## VERIFICATION FAILED\n\n{feedback}\n\n"
+                        f"Fix the issues above and ensure all outputs are correct.",
+                        timeout=1800.0,
+                    )
+                    if not isinstance(raw_result, str):
+                        raw_result = str(raw_result)
+                    continue
+
+            # Safety net
+            return ToolResult(
+                text_result_for_llm=f"Error: skill '{skill_name}' loop exceeded safety limit.",
+                result_type="error",
+            )
+        finally:
+            await child.destroy()
 
     prompt = build_skill_tool_prompt(skill_map)
 
