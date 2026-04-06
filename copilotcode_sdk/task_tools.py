@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from typing import Any
 
 from .tasks import TaskStatus, TaskStore
@@ -62,6 +64,38 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                 )
             return ToolResult(text_result_for_llm=f"Task #{task_id} deleted.")
 
+        # Handle dependency additions
+        add_blocked_by = args.get("addBlockedBy")
+        add_blocks = args.get("addBlocks")
+        if add_blocked_by:
+            for bid in add_blocked_by:
+                try:
+                    ok = store.add_dependency(task_id, int(bid))
+                    if not ok:
+                        return ToolResult(
+                            text_result_for_llm=f"Error: cannot add dependency #{bid} → #{task_id} (not found or circular).",
+                            result_type="error",
+                        )
+                except (TypeError, ValueError):
+                    return ToolResult(
+                        text_result_for_llm=f"Error: invalid blocker id '{bid}'.",
+                        result_type="error",
+                    )
+        if add_blocks:
+            for bid in add_blocks:
+                try:
+                    ok = store.add_dependency(int(bid), task_id)
+                    if not ok:
+                        return ToolResult(
+                            text_result_for_llm=f"Error: cannot add dependency #{task_id} → #{bid} (not found or circular).",
+                            result_type="error",
+                        )
+                except (TypeError, ValueError):
+                    return ToolResult(
+                        text_result_for_llm=f"Error: invalid blocked id '{bid}'.",
+                        result_type="error",
+                    )
+
         status = args.get("status")
         if status is not None:
             # Accept common aliases
@@ -89,6 +123,15 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                 result_type="error",
             )
 
+        # Check if update was blocked by dependencies
+        blocked_reason = task.metadata.pop("_blocked_reason", None)
+        if blocked_reason:
+            store.update(task_id, metadata=task.metadata)  # persist the pop
+            return ToolResult(
+                text_result_for_llm=f"Task #{task.id}: {blocked_reason}",
+                result_type="error",
+            )
+
         result = f"Task #{task.id} updated: [{task.status.value}] {task.subject}"
         if task.status == TaskStatus.completed:
             open_tasks = store.list_open()
@@ -97,6 +140,19 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                 result += f"\n\n{len(pending)} task(s) remaining. Use TaskList to find next work."
             else:
                 result += "\n\nAll tasks complete!"
+                # Verification nudge: all 3+ tasks completed, none is verification
+                all_tasks = store.list_all()
+                non_deleted = [t for t in all_tasks if t.status != TaskStatus.deleted]
+                if (
+                    len(non_deleted) >= 3
+                    and not store.has_open_tasks()
+                    and not any(re.search(r"verif", t.subject, re.IGNORECASE) for t in non_deleted)
+                ):
+                    result += (
+                        "\n\nYou just closed out all tasks and none was a verification step. "
+                        "Before writing the final summary, consider spawning the verifier agent "
+                        "to confirm the work is correct."
+                    )
         return ToolResult(text_result_for_llm=result)
 
     def _task_list(invocation: ToolInvocation) -> ToolResult:
@@ -135,6 +191,68 @@ def build_task_tools(store: TaskStore) -> list[Any]:
         return ToolResult(
             text_result_for_llm=json.dumps(task.to_dict(), indent=2),
         )
+
+    def _task_output(invocation: ToolInvocation) -> ToolResult:
+        args = invocation.arguments or {}
+        task_id = args.get("task_id")
+        if task_id is None:
+            return ToolResult(
+                text_result_for_llm="Error: 'task_id' is required.",
+                result_type="error",
+            )
+        try:
+            task_id = int(task_id)
+        except (TypeError, ValueError):
+            return ToolResult(
+                text_result_for_llm=f"Error: invalid task_id '{task_id}'.",
+                result_type="error",
+            )
+        task = store.get(task_id)
+        if task is None:
+            return ToolResult(
+                text_result_for_llm=f"Error: task #{task_id} not found.",
+                result_type="error",
+            )
+        block = args.get("block", True)
+        timeout = float(args.get("timeout", 300))
+
+        # Non-blocking check
+        output = store.read_task_output(task_id)
+        if output is not None:
+            store.mark_notified(task_id)
+            return ToolResult(text_result_for_llm=json.dumps({
+                "retrieval_status": "success",
+                "task_id": task_id,
+                "status": task.status.value,
+                "output": output,
+            }, indent=2))
+
+        if not block:
+            return ToolResult(text_result_for_llm=json.dumps({
+                "retrieval_status": "not_ready",
+                "task_id": task_id,
+                "status": task.status.value,
+            }, indent=2))
+
+        # Blocking: poll until ready or timeout
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            output = store.read_task_output(task_id)
+            if output is not None:
+                store.mark_notified(task_id)
+                return ToolResult(text_result_for_llm=json.dumps({
+                    "retrieval_status": "success",
+                    "task_id": task_id,
+                    "status": task.status.value,
+                    "output": output,
+                }, indent=2))
+            time.sleep(0.1)
+
+        return ToolResult(text_result_for_llm=json.dumps({
+            "retrieval_status": "timeout",
+            "task_id": task_id,
+            "status": task.status.value,
+        }, indent=2))
 
     tools = [
         Tool(
@@ -208,6 +326,16 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                         "type": "object",
                         "description": "Metadata to merge into the task.",
                     },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Task IDs that must complete before this task can start.",
+                    },
+                    "addBlocks": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Task IDs that this task blocks (cannot start until this completes).",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -236,6 +364,33 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                     "task_id": {
                         "type": "integer",
                         "description": "ID of the task to retrieve.",
+                    },
+                },
+                "required": ["task_id"],
+            },
+            skip_permission=True,
+        ),
+        Tool(
+            name="TaskOutput",
+            description=(
+                "Read the output/result of a task. Blocks until output is available "
+                "or timeout. Use to retrieve results from completed background tasks."
+            ),
+            handler=_task_output,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "ID of the task to read output from.",
+                    },
+                    "block": {
+                        "type": "boolean",
+                        "description": "If true (default), wait for output. If false, return immediately.",
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Max seconds to wait (default 30, max 600).",
                     },
                 },
                 "required": ["task_id"],

@@ -858,19 +858,24 @@ class TestCompleteSkillVerification:
             completed = set()
 
         class FakeChild:
+            def __init__(self):
+                self._last_response = ""
             async def send_and_wait(self, prompt, *, timeout=None):
-                return (
+                self._last_response = (
                     "### Check: basic\n"
                     "**Command run:**\n  echo ok\n"
                     "**Output observed:**\n  ok\n"
                     f"**Result: {'PASS' if 'PASS' in fork_output else 'FAIL'}**\n\n"
                     f"{fork_output}"
                 )
+                return self._last_response
+            async def get_last_response_text(self):
+                return self._last_response
             async def destroy(self):
                 pass
 
         class FakeSession:
-            async def fork_child(self, spec):
+            async def fork_child(self, spec, **kw):
                 return FakeChild()
 
         tool = build_complete_skill_tool(

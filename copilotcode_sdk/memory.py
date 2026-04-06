@@ -10,9 +10,11 @@ from typing import Literal
 from .brand import BrandSpec, DEFAULT_BRAND
 
 ENTRYPOINT_NAME = "MEMORY.md"
+SESSION_MEMORY_NAME = "session_memory.md"
 MAX_ENTRYPOINT_LINES = 200
 MAX_ENTRYPOINT_BYTES = 25_000
 MAX_RELEVANT_MEMORIES = 5
+MAX_SESSION_MEMORY_ENTRIES = 20
 
 MemoryType = Literal["user", "feedback", "project", "reference"]
 VALID_MEMORY_TYPES: set[str] = {"user", "feedback", "project", "reference"}
@@ -368,6 +370,93 @@ class MemoryStore:
         index_content = "\n".join(entries)
         self.index_path.write_text(index_content + ("\n" if entries else ""), encoding="utf-8")
         return index_content
+
+    # -- Session-scoped memory --
+
+    @property
+    def session_memory_path(self) -> Path:
+        """Path to the session-scoped memory file."""
+        return self.memory_dir / SESSION_MEMORY_NAME
+
+    def append_session_memory(self, entry: str) -> Path:
+        """Append a timestamped entry to the session memory file.
+
+        Session memory captures within-session learnings that haven't been
+        promoted to durable memory yet.  Bounded to
+        :data:`MAX_SESSION_MEMORY_ENTRIES` entries.
+        """
+        self.ensure()
+        path = self.session_memory_path
+        existing = ""
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+
+        entries = [e for e in existing.strip().split("\n---\n") if e.strip()]
+        entries.append(entry.strip())
+        # Bound: keep only the most recent entries
+        if len(entries) > MAX_SESSION_MEMORY_ENTRIES:
+            entries = entries[-MAX_SESSION_MEMORY_ENTRIES:]
+
+        path.write_text("\n---\n".join(entries) + "\n", encoding="utf-8")
+        return path
+
+    def write_session_memory(self, content: str) -> Path:
+        """Overwrite the session memory file with complete updated content.
+
+        Unlike :meth:`append_session_memory`, this replaces the entire file.
+        Used by the maintenance pass which produces a complete updated notes
+        document each time.
+        """
+        self.ensure()
+        path = self.session_memory_path
+        path.write_text(content.strip() + "\n", encoding="utf-8")
+        return path
+
+    def read_session_memory(self) -> str:
+        """Read the current session memory contents."""
+        path = self.session_memory_path
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")
+
+    def clear_session_memory(self) -> None:
+        """Remove the session memory file (e.g. at session end after promotion)."""
+        path = self.session_memory_path
+        if path.exists():
+            path.unlink()
+
+    def promote_session_memory(self) -> list[Path]:
+        """Promote session memory entries to durable project memories.
+
+        Parses the session memory file for structured entries and creates
+        proper durable memories.  Returns paths of created memory files.
+        Clears the session memory afterward.
+        """
+        content = self.read_session_memory()
+        if not content.strip():
+            return []
+
+        entries = [e.strip() for e in content.split("\n---\n") if e.strip()]
+        created: list[Path] = []
+        for entry in entries:
+            # Try to extract a title from the first line
+            lines = entry.strip().splitlines()
+            title = lines[0].lstrip("#").strip() if lines else "Session learning"
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else entry
+            if not body:
+                body = title
+
+            path = self.upsert_memory(
+                title=title,
+                description=f"Promoted from session memory",
+                memory_type="project",
+                content=body,
+                slug=f"session-{slugify(title)}",
+            )
+            created.append(path)
+
+        self.clear_session_memory()
+        return created
 
     def _resolve_memory_path(self, slug_or_path: str | Path) -> Path:
         candidate = Path(slug_or_path)

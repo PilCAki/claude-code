@@ -195,3 +195,73 @@ class TestTaskGet:
     def test_get_invalid_id(self, tools):
         result = _call(tools, "TaskGet", {"task_id": "abc"})
         assert result.result_type == "error"
+
+
+# ---------------------------------------------------------------------------
+# Wave 3.2: TaskOutput tool
+# ---------------------------------------------------------------------------
+
+
+class TestTaskOutput:
+    def test_output_success(self, tools, store, tmp_path):
+        store._outputs_dir = tmp_path / "outputs"
+        store.create("Work")
+        store.write_task_output(1, "Result data here")
+        result = _call(tools, "TaskOutput", {"task_id": 1})
+        assert '"retrieval_status": "success"' in result.text_result_for_llm
+        assert "Result data here" in result.text_result_for_llm
+
+    def test_output_not_ready_nonblocking(self, tools, store, tmp_path):
+        store._outputs_dir = tmp_path / "outputs"
+        store.create("Work")
+        result = _call(tools, "TaskOutput", {"task_id": 1, "block": False})
+        assert '"retrieval_status": "not_ready"' in result.text_result_for_llm
+
+    def test_output_timeout(self, tools, store, tmp_path):
+        store._outputs_dir = tmp_path / "outputs"
+        store.create("Work")
+        result = _call(tools, "TaskOutput", {"task_id": 1, "block": True, "timeout": 0.2})
+        assert '"retrieval_status": "timeout"' in result.text_result_for_llm
+
+    def test_output_nonexistent_task(self, tools):
+        result = _call(tools, "TaskOutput", {"task_id": 999})
+        assert result.result_type == "error"
+
+    def test_output_marks_notified(self, tools, store, tmp_path):
+        store._outputs_dir = tmp_path / "outputs"
+        store.create("Work")
+        store.write_task_output(1, "Done")
+        _call(tools, "TaskOutput", {"task_id": 1})
+        assert store.get(1).metadata.get("notified") is True
+
+
+# ---------------------------------------------------------------------------
+# Wave 3.2: Verification nudge
+# ---------------------------------------------------------------------------
+
+
+class TestVerificationNudge:
+    def test_nudge_fires_with_3_plus_tasks(self, tools, store):
+        store.create("Task A")
+        store.create("Task B")
+        store.create("Task C")
+        store.update(1, status="completed")
+        store.update(2, status="completed")
+        result = _call(tools, "TaskUpdate", {"task_id": 3, "status": "completed"})
+        assert "verification step" in result.text_result_for_llm.lower()
+
+    def test_nudge_skipped_with_verif_task(self, tools, store):
+        store.create("Task A")
+        store.create("Task B")
+        store.create("Verify results")  # matches /verif/i
+        store.update(1, status="completed")
+        store.update(2, status="completed")
+        result = _call(tools, "TaskUpdate", {"task_id": 3, "status": "completed"})
+        assert "verification step" not in result.text_result_for_llm.lower()
+
+    def test_nudge_skipped_under_3_tasks(self, tools, store):
+        store.create("Task A")
+        store.create("Task B")
+        store.update(1, status="completed")
+        result = _call(tools, "TaskUpdate", {"task_id": 2, "status": "completed"})
+        assert "verification step" not in result.text_result_for_llm.lower()

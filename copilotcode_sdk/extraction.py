@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Literal, Sequence
+
+ExtractionMode = Literal["nudge", "enforce"]
+
 DEFAULT_TOOL_CALL_INTERVAL = 20
 DEFAULT_CHAR_THRESHOLD = 50_000
 DEFAULT_MIN_TURN_GAP = 10
@@ -56,6 +60,29 @@ def build_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
     )
 
 
+def build_enforce_extraction_prompt(*, memory_dir: str, session_memory_path: str) -> str:
+    """Enforcement-mode extraction: writes directly to session memory.
+
+    Unlike the nudge mode, this tells the agent to write structured entries
+    to the session memory file, which can later be promoted to durable memory.
+    """
+    return (
+        "**Memory enforcement checkpoint.** You MUST save at least one learning "
+        "from this session RIGHT NOW. Do not skip this step.\n\n"
+        "Write a structured entry to the session memory file:\n"
+        f"  Path: `{session_memory_path}`\n\n"
+        "Format each entry as:\n"
+        "```\n"
+        "# <Title>\n"
+        "<What you learned, with specific details>\n"
+        "```\n\n"
+        "Separate multiple entries with `---` on its own line.\n\n"
+        "Focus on: data structure insights, schema relationships, "
+        "key metrics, user preferences, or decisions that future sessions need.\n\n"
+        "Continue with your current work after writing."
+    )
+
+
 def build_session_end_extraction_prompt(*, memory_dir: str, project_root: str) -> str:
     """Urgent extraction prompt fired when all skills are complete.
 
@@ -74,4 +101,61 @@ def build_session_end_extraction_prompt(*, memory_dir: str, project_root: str) -
         f"Project root: `{project_root}`\n\n"
         "Write at least one memory file. Future sessions on this project will "
         "benefit from what you learned today."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session memory update prompt (for autonomous maintenance pass)
+# ---------------------------------------------------------------------------
+
+SESSION_MEMORY_SECTIONS: tuple[str, ...] = (
+    "Session Title",
+    "Current State",
+    "Task Specification",
+    "Files and Functions",
+    "Workflow",
+    "Errors & Corrections",
+    "Codebase/System Documentation",
+    "Learnings",
+    "Key Results",
+    "Worklog",
+)
+
+
+def build_session_memory_update_prompt(
+    *,
+    existing_memory: str,
+    sections: Sequence[str] = SESSION_MEMORY_SECTIONS,
+    max_total_tokens: int = 12_000,
+    max_section_tokens: int = 2_000,
+) -> str:
+    """Build the prompt for the session-memory maintenance pass.
+
+    This prompt is sent to a short-lived maintenance session (not the main
+    conversation) to update the structured session notes file.
+    """
+    section_template = "\n".join(
+        f"## {name}\n*Update with relevant information from the conversation.*"
+        for name in sections
+    )
+
+    return (
+        "You are a session-memory maintenance agent. You are NOT part of the "
+        "main conversation. Your only job is to update the structured session "
+        "notes below based on new conversation activity.\n\n"
+        "Current session notes:\n"
+        f"<current_notes_content>\n{existing_memory}\n</current_notes_content>\n\n"
+        "If the notes are empty, initialize them with this structure:\n"
+        f"```markdown\n{section_template}\n```\n\n"
+        "Rules:\n"
+        "- Preserve the section headers exactly as shown.\n"
+        "- Update only the content under each section, not the headers.\n"
+        "- Be specific: include file paths, function names, metric values, "
+        "error messages.\n"
+        "- Remove stale information that is no longer accurate.\n"
+        "- Keep each section concise — no more than a few paragraphs.\n"
+        f"- Stay within ~{max_section_tokens:,} tokens per section "
+        f"and ~{max_total_tokens:,} tokens total.\n\n"
+        "Respond with the complete updated notes document. "
+        "Do not include any explanation outside the notes."
     )

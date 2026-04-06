@@ -1,11 +1,182 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .config import CopilotCodeConfig
+from .mcp import build_mcp_prompt_section
 from .skill_assets import build_skill_catalog
+
+
+# ---------------------------------------------------------------------------
+# Priority stack model
+# ---------------------------------------------------------------------------
+
+
+class PromptPriority(IntEnum):
+    """Priority levels for prompt sections.  Higher priority wins when
+    two sections share the same *name*."""
+
+    base = 0
+    default = 10
+    agent = 20
+    skill = 30
+    custom = 40
+    override = 50
+
+
+@dataclass(slots=True)
+class PromptSection:
+    """A single section of the system prompt with priority metadata."""
+
+    name: str
+    content: str
+    priority: PromptPriority = PromptPriority.default
+    cacheable: bool = True
+
+
+class PromptAssembler:
+    """Assembles a system prompt from prioritised sections.
+
+    Sections with the same ``name`` are deduplicated — the highest-priority
+    version wins.  The final output preserves insertion order (first-seen
+    name wins for ordering), which keeps the prompt layout predictable.
+
+    Typical usage::
+
+        asm = PromptAssembler()
+        asm.add_base_sections(config)        # static base
+        asm.add("skill_catalog", catalog, priority=PromptPriority.skill)
+        asm.add("custom_rules", rules, priority=PromptPriority.custom)
+        prompt = asm.render()
+    """
+
+    def __init__(self) -> None:
+        self._sections: dict[str, PromptSection] = {}
+        self._order: list[str] = []
+        self._stale_sections: set[str] = set()
+
+    def add(
+        self,
+        name: str,
+        content: str,
+        *,
+        priority: PromptPriority = PromptPriority.default,
+        cacheable: bool = True,
+    ) -> None:
+        """Add or replace a named section.
+
+        If a section with the same *name* already exists, the higher-priority
+        version wins.  If priorities are equal, the newer one replaces.
+        """
+        existing = self._sections.get(name)
+        if existing is not None and existing.priority > priority:
+            return  # existing has higher priority — keep it
+        self._sections[name] = PromptSection(
+            name=name, content=content, priority=priority, cacheable=cacheable,
+        )
+        if name not in self._order:
+            self._order.append(name)
+        self._stale_sections.discard(name)
+
+    def remove(self, name: str) -> None:
+        """Remove a section by name (no-op if absent)."""
+        self._sections.pop(name, None)
+        if name in self._order:
+            self._order.remove(name)
+
+    def has(self, name: str) -> bool:
+        return name in self._sections
+
+    def render(self, *, cacheable_only: bool = False) -> str:
+        """Render all sections in insertion order.
+
+        If *cacheable_only* is ``True``, only include sections marked as
+        cacheable (useful for prompt caching).
+        """
+        parts: list[str] = []
+        for name in self._order:
+            section = self._sections.get(name)
+            if section is None:
+                continue
+            if cacheable_only and not section.cacheable:
+                continue
+            if section.content.strip():
+                parts.append(section.content)
+        return "\n\n".join(parts).strip()
+
+    def render_dynamic(self) -> str:
+        """Render only non-cacheable (dynamic) sections."""
+        parts: list[str] = []
+        for name in self._order:
+            section = self._sections.get(name)
+            if section is None:
+                continue
+            if section.cacheable:
+                continue
+            if section.content.strip():
+                parts.append(section.content)
+        return "\n\n".join(parts).strip()
+
+    def mark_stale(self, name: str) -> None:
+        """Mark a section as stale so it will be refreshed on next check."""
+        if name in self._sections:
+            self._stale_sections.add(name)
+
+    def has_stale_sections(self) -> bool:
+        """Return True if any sections are marked stale."""
+        return bool(self._stale_sections)
+
+    def refresh_section(self, name: str, content: str, **kwargs: Any) -> None:
+        """Update a section's content and clear its stale flag.
+
+        Preserves the section's existing priority and cacheability unless
+        overridden via kwargs.
+        """
+        existing = self._sections.get(name)
+        if existing is not None:
+            self._sections[name] = PromptSection(
+                name=name,
+                content=content,
+                priority=kwargs.get("priority", existing.priority),
+                cacheable=kwargs.get("cacheable", existing.cacheable),
+            )
+        else:
+            self.add(name, content, **kwargs)
+        self._stale_sections.discard(name)
+
+    @property
+    def section_names(self) -> list[str]:
+        """Names of all sections in insertion order."""
+        return list(self._order)
+
+    def add_base_sections(self, config: CopilotCodeConfig) -> None:
+        """Populate the assembler with the standard base sections."""
+        self.add("intro", _intro(config), priority=PromptPriority.base, cacheable=True)
+        self.add("cyber_risk", CYBER_RISK_INSTRUCTION, priority=PromptPriority.base, cacheable=True)
+        self.add("core_rules", _section("Core Operating Rules", _core_operating_rules()), priority=PromptPriority.base)
+        self.add("tool_rules", _section("Tool Usage Rules", _tool_usage_rules()), priority=PromptPriority.base)
+        self.add("tool_caveats", _section("Tool Output Caveats", _tool_caveat_rules()), priority=PromptPriority.base)
+        self.add("output_efficiency", _section("Output Efficiency", _output_efficiency_rules()), priority=PromptPriority.base)
+        self.add("actions_with_care", _section("Actions With Care", _actions_with_care_rules()), priority=PromptPriority.base)
+        self.add("tone_output", _section("Tone And Output", _tone_output_rules()), priority=PromptPriority.base)
+        self.add("session_guidance", _section("Session Guidance", _session_guidance()), priority=PromptPriority.base)
+        # Dynamic boundary — everything after this is session-specific
+        self.add("dynamic_boundary", SYSTEM_PROMPT_DYNAMIC_BOUNDARY, priority=PromptPriority.base, cacheable=True)
+        # Git context (session-specific, after boundary)
+        git_ctx = gather_git_context(config.working_path)
+        if git_ctx:
+            self.add("git_context", git_ctx, priority=PromptPriority.default, cacheable=False)
+
+
+# ---------------------------------------------------------------------------
+# Section formatting helper
+# ---------------------------------------------------------------------------
 
 
 def _section(title: str, lines: Iterable[str]) -> str:
@@ -39,8 +210,9 @@ def _core_operating_rules() -> tuple[str, ...]:
         "Be truthful about outcomes. If a check failed or you did not run it, say so plainly.",
         "For risky, destructive, or externally visible actions, pause and confirm unless the user already gave durable authorization.",
         "Prefer the smallest complete change over a half-finished implementation or a gold-plated rewrite.",
-        "When starting a task, check available skills and their dependencies. After completing one skill's scope, check if downstream skills should be triggered.",
-        'When a skill declares `requires: <type>`, verify that a skill of that type has been completed before starting.',
+        "When starting a task, check available skills using the InvokeSkill tool. Execute matching skills via InvokeSkill instead of doing the work yourself — the skill runs in an isolated session with full methodology loaded.",
+        "After a skill completes, check if downstream skills are now unblocked and invoke them. Do not stop until all skills in the dependency chain are complete.",
+        'When a skill declares `requires: <type>`, its prerequisite must be completed first. InvokeSkill will enforce this.',
     )
 
 
@@ -97,9 +269,84 @@ def _session_guidance() -> tuple[str, ...]:
         "Verify the result with the narrowest useful tests, scripts, or runtime checks before claiming completion.",
         "If the first attempt fails, read the error and adjust instead of blindly retrying the same action.",
         "When reviewing or verifying code, prioritize regressions, missing tests, and behavioral risk over stylistic commentary.",
-        "After completing a skill or major phase of work, check the skill catalog for downstream skills that should be triggered next.",
-        "Do not stop after completing one skill if downstream skills exist and their prerequisites are now met.",
+        "After a skill completes via InvokeSkill, immediately check for downstream skills whose prerequisites are now met and invoke them.",
+        "Do not stop or summarize until all available skills in the dependency chain have been executed via InvokeSkill.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Git context gathering
+# ---------------------------------------------------------------------------
+
+
+def gather_git_context(working_path: Path) -> str:
+    """Gather git branch, status, recent commits, and user name.
+
+    Returns a formatted context block, or an empty string if not a git repo.
+    """
+    def _git(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "--no-optional-locks", *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=str(working_path),
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return ""
+
+    # Quick check: is this a git repo?
+    if not _git("rev-parse", "--is-inside-work-tree"):
+        return ""
+
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    # Detect default branch (main or master)
+    main_branch = ""
+    for candidate in ("main", "master"):
+        if _git("rev-parse", "--verify", f"refs/heads/{candidate}"):
+            main_branch = candidate
+            break
+    status = _git("status", "--short")
+    if len(status) > 2000:
+        status = status[:2000] + "\n..."
+    log = _git("log", "--oneline", "-n", "5")
+    user_name = _git("config", "user.name")
+
+    parts = ["# gitStatus"]
+    if branch:
+        parts.append(f"Current branch: {branch}")
+    if main_branch:
+        parts.append(f"Main branch: {main_branch}")
+    if user_name:
+        parts.append(f"Git user: {user_name}")
+    if status:
+        parts.append(f"\nStatus:\n{status}")
+    if log:
+        parts.append(f"\nRecent commits:\n{log}")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Cyber risk instruction
+# ---------------------------------------------------------------------------
+
+CYBER_RISK_INSTRUCTION = (
+    "IMPORTANT: Assist with authorized security testing, defensive security, "
+    "CTF challenges, and educational contexts. Refuse requests for destructive "
+    "techniques, DoS attacks, mass targeting, supply chain compromise, or "
+    "detection evasion for malicious purposes. Dual-use security tools "
+    "(C2 frameworks, credential testing, exploit development) require clear "
+    "authorization context: pentesting engagements, CTF competitions, security "
+    "research, or defensive use cases."
+)
+
+# ---------------------------------------------------------------------------
+# Dynamic boundary marker
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
 
 def _task_guidance() -> tuple[str, ...]:
@@ -226,31 +473,79 @@ def build_system_message(
     disabled_skills: Sequence[str] | None = None,
     memory_dir: str | None = None,
 ) -> str:
+    """Build the full system message using the priority-stack assembler.
+
+    This is backward-compatible: callers get the same string output.
+    Internally it uses :class:`PromptAssembler` so sections can be
+    overridden or extended by higher-priority layers.
+    """
+    asm = build_assembler(
+        config,
+        skill_directories=skill_directories,
+        disabled_skills=disabled_skills,
+        memory_dir=memory_dir,
+    )
+    return asm.render()
+
+
+def build_assembler(
+    config: CopilotCodeConfig | None = None,
+    *,
+    skill_directories: Sequence[str] | None = None,
+    disabled_skills: Sequence[str] | None = None,
+    memory_dir: str | None = None,
+) -> PromptAssembler:
+    """Build a :class:`PromptAssembler` populated with all standard sections.
+
+    Callers that need to customise the prompt (e.g. add agent-specific
+    overrides or dynamic per-turn sections) can modify the returned
+    assembler before calling :meth:`~PromptAssembler.render`.
+    """
     cfg = config or CopilotCodeConfig()
-    sections = [
-        _intro(cfg),
-        _section("Core Operating Rules", _core_operating_rules()),
-        _section("Tool Usage Rules", _tool_usage_rules()),
-        _section("Tool Output Caveats", _tool_caveat_rules()),
-        _section("Output Efficiency", _output_efficiency_rules()),
-        _section("Actions With Care", _actions_with_care_rules()),
-        _section("Tone And Output", _tone_output_rules()),
-        _section("Session Guidance", _session_guidance()),
-    ]
+    asm = PromptAssembler()
+    asm.add_base_sections(cfg)
+
     if cfg.enable_tasks_v2:
-        sections.append(_section("Task Management", _task_guidance()))
+        asm.add(
+            "task_management",
+            _section("Task Management", _task_guidance()),
+            priority=PromptPriority.default,
+        )
     if skill_directories:
         catalog_text, _ = build_skill_catalog(
             skill_directories,
             disabled_skills=disabled_skills or (),
         )
         if catalog_text:
-            sections.append(catalog_text)
+            asm.add(
+                "skill_catalog",
+                catalog_text,
+                priority=PromptPriority.skill,
+                cacheable=False,  # skills may change between sessions
+            )
     if cfg.enable_hybrid_memory:
-        sections.append(_memory_guidance(cfg, memory_dir=memory_dir))
+        asm.add(
+            "memory_guidance",
+            _memory_guidance(cfg, memory_dir=memory_dir),
+            priority=PromptPriority.default,
+        )
+    if cfg.mcp_servers:
+        mcp_section = build_mcp_prompt_section(cfg.mcp_servers)
+        if mcp_section:
+            asm.add(
+                "mcp_servers",
+                mcp_section,
+                priority=PromptPriority.default,
+                cacheable=False,  # MCP server state may change between turns
+            )
     if cfg.extra_prompt_sections:
-        sections.extend(cfg.extra_prompt_sections)
-    return "\n\n".join(sections).strip()
+        for i, section in enumerate(cfg.extra_prompt_sections):
+            asm.add(
+                f"extra_{i}",
+                section,
+                priority=PromptPriority.custom,
+            )
+    return asm
 
 
 def render_claude_md_template(config: CopilotCodeConfig | None = None) -> str:

@@ -9,6 +9,8 @@ from copilotcode_sdk.memory import (
     ENTRYPOINT_NAME,
     MAX_ENTRYPOINT_BYTES,
     MAX_ENTRYPOINT_LINES,
+    MAX_SESSION_MEMORY_ENTRIES,
+    SESSION_MEMORY_NAME,
     MemoryStore,
     parse_frontmatter_document,
     sanitize_project_key,
@@ -182,3 +184,100 @@ def test_memory_property_style_slugify_and_sanitize(tmp_path: Path) -> None:
 
     run_slugify()
     run_sanitize()
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: Session-scoped memory tests
+# ---------------------------------------------------------------------------
+
+
+class TestSessionMemory:
+    def test_session_memory_path(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+
+        assert store.session_memory_path.name == SESSION_MEMORY_NAME
+
+    def test_append_creates_file_and_returns_path(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+
+        path = store.append_session_memory("# First\nLearned X.")
+
+        assert path.exists()
+        assert "Learned X." in path.read_text(encoding="utf-8")
+
+    def test_append_multiple_entries_separated_by_delimiter(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+        store.append_session_memory("# Entry 1\nFirst learning")
+        store.append_session_memory("# Entry 2\nSecond learning")
+
+        content = store.read_session_memory()
+
+        assert "First learning" in content
+        assert "Second learning" in content
+        assert "\n---\n" in content
+
+    def test_read_returns_empty_when_no_session_file(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+
+        assert store.read_session_memory() == ""
+
+    def test_clear_removes_session_file(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+        store.append_session_memory("# Something\nData")
+
+        store.clear_session_memory()
+
+        assert not store.session_memory_path.exists()
+        assert store.read_session_memory() == ""
+
+    def test_clear_is_noop_when_no_file(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+        store.clear_session_memory()  # should not raise
+
+    def test_append_bounds_to_max_entries(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+
+        for i in range(MAX_SESSION_MEMORY_ENTRIES + 5):
+            store.append_session_memory(f"# Entry {i}\nContent {i}")
+
+        content = store.read_session_memory()
+        entries = [e for e in content.strip().split("\n---\n") if e.strip()]
+
+        assert len(entries) == MAX_SESSION_MEMORY_ENTRIES
+        # Oldest entries should be dropped — the last entry should be present
+        assert f"Content {MAX_SESSION_MEMORY_ENTRIES + 4}" in content
+        # The very first entry should have been evicted
+        assert "Content 0" not in content
+
+    def test_promote_creates_durable_memories(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+        store.append_session_memory("# Schema Discovery\nTable has 10 columns")
+        store.append_session_memory("# Data Quality\nNull rate is 5%")
+
+        created = store.promote_session_memory()
+
+        assert len(created) == 2
+        assert all(p.exists() for p in created)
+        # Session file should be cleared after promotion
+        assert store.read_session_memory() == ""
+        # Durable memory index should contain the promoted entries
+        index_text = store.index_path.read_text(encoding="utf-8")
+        assert "Schema Discovery" in index_text
+        assert "Data Quality" in index_text
+
+    def test_promote_empty_session_returns_empty(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+
+        created = store.promote_session_memory()
+
+        assert created == []
+
+    def test_promote_uses_first_line_as_title(self, tmp_path: Path) -> None:
+        store = MemoryStore(tmp_path, tmp_path / ".mem")
+        store.append_session_memory("# My Title\nBody content here")
+
+        created = store.promote_session_memory()
+
+        assert len(created) == 1
+        content = created[0].read_text(encoding="utf-8")
+        assert "name: My Title" in content

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from copilotcode_sdk.skill_assets import parse_skill_frontmatter, build_skill_catalog
+from copilotcode_sdk.skill_assets import parse_skill_frontmatter, build_skill_catalog, SkillTracker
 
 
 def _write_skill(skill_dir: Path, name: str, frontmatter: str) -> Path:
@@ -103,3 +103,177 @@ def test_build_skill_catalog_returns_empty_for_no_skills(tmp_path: Path) -> None
 
     assert catalog == ""
     assert skill_map == {}
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: SkillTracker tests
+# ---------------------------------------------------------------------------
+
+
+def _sample_skill_map() -> dict[str, dict[str, str]]:
+    """A minimal skill map with a dependency chain: intake → analysis → report."""
+    return {
+        "intake": {"name": "intake", "type": "data-intake", "requires": "none"},
+        "analysis": {"name": "analysis", "type": "business-analysis", "requires": "data-intake"},
+        "report": {"name": "report", "type": "report-generation", "requires": "business-analysis"},
+    }
+
+
+class TestSkillTracker:
+    def test_initial_state(self) -> None:
+        tracker = SkillTracker()
+
+        assert tracker.current_turn == 0
+        assert tracker.invocation_count("x") == 0
+        assert tracker.completion_count("x") == 0
+        assert tracker.last_used_turn("x") == -1
+
+    def test_record_invocation(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_invocation("intake")
+
+        assert tracker.invocation_count("intake") == 1
+        assert tracker.last_used_turn("intake") == 0
+
+    def test_record_completion(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_completion("intake")
+
+        assert tracker.completion_count("intake") == 1
+
+    def test_advance_turn(self) -> None:
+        tracker = SkillTracker()
+        tracker.advance_turn()
+        tracker.advance_turn()
+
+        assert tracker.current_turn == 2
+
+    def test_score_no_prereqs_not_completed_never_invoked(self) -> None:
+        """A fresh skill with no prereqs should get the maximum positive score."""
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        score = tracker.score("intake", skill_map, completed_skills=set())
+
+        # +10 (no prereqs) + 5 (not completed) + 3 (never invoked) = 18
+        assert score == 18.0
+
+    def test_score_prereqs_not_met(self) -> None:
+        """A skill whose prereqs are not met should be strongly deprioritized."""
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        score = tracker.score("analysis", skill_map, completed_skills=set())
+
+        # -20 (prereqs not met) + 5 (not completed) + 3 (never invoked) = -12
+        assert score == -12.0
+
+    def test_score_prereqs_met(self) -> None:
+        """A skill whose prereqs are met should get the prereqs bonus."""
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        score = tracker.score("analysis", skill_map, completed_skills={"intake"})
+
+        # +10 (prereqs met) + 5 (not completed) + 3 (never invoked) = 18
+        assert score == 18.0
+
+    def test_score_completed_skill_loses_bonus(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        score = tracker.score("intake", skill_map, completed_skills={"intake"})
+
+        # +10 (no prereqs) + 0 (completed) + 3 (never invoked) = 13
+        assert score == 13.0
+
+    def test_score_recency_penalty_very_recent(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_invocation("intake")
+        tracker.advance_turn()
+        tracker.advance_turn()  # 2 turns ago
+
+        skill_map = _sample_skill_map()
+        score = tracker.score("intake", skill_map, completed_skills=set())
+
+        # +10 + 5 + 0 (was invoked) - 3 (very recent) = 12
+        assert score == 12.0
+
+    def test_score_recency_penalty_somewhat_recent(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_invocation("intake")
+        for _ in range(8):
+            tracker.advance_turn()  # 8 turns ago
+
+        skill_map = _sample_skill_map()
+        score = tracker.score("intake", skill_map, completed_skills=set())
+
+        # +10 + 5 + 0 (was invoked) - 1 (somewhat recent) = 14
+        assert score == 14.0
+
+    def test_score_no_recency_penalty_after_15_turns(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_invocation("intake")
+        for _ in range(20):
+            tracker.advance_turn()
+
+        skill_map = _sample_skill_map()
+        score = tracker.score("intake", skill_map, completed_skills=set())
+
+        # +10 + 5 + 0 (was invoked) + 0 (no recency penalty) = 15
+        assert score == 15.0
+
+    def test_rank_returns_sorted_by_score(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        ranked = tracker.rank(skill_map, completed_skills=set())
+
+        # intake (no prereqs) should be first, analysis/report (unmet prereqs) lower
+        assert ranked[0][0] == "intake"
+        assert ranked[0][1] > ranked[-1][1]
+
+    def test_rank_with_partial_completion(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        ranked = tracker.rank(skill_map, completed_skills={"intake"})
+
+        names = [name for name, _ in ranked]
+        # analysis should now rank high since its prereq is met
+        assert "analysis" in names[:2]
+
+    def test_top_surfaceable_excludes_completed(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        top = tracker.top_surfaceable(skill_map, completed_skills={"intake"})
+
+        assert "intake" not in top
+
+    def test_top_surfaceable_respects_limit(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        top = tracker.top_surfaceable(skill_map, completed_skills=set(), limit=1)
+
+        assert len(top) <= 1
+
+    def test_top_surfaceable_respects_min_score(self) -> None:
+        tracker = SkillTracker()
+        skill_map = _sample_skill_map()
+
+        # With min_score=100, nothing should qualify
+        top = tracker.top_surfaceable(
+            skill_map, completed_skills=set(), min_score=100.0,
+        )
+
+        assert top == []
+
+    def test_multiple_invocations_counted(self) -> None:
+        tracker = SkillTracker()
+        tracker.record_invocation("intake")
+        tracker.record_invocation("intake")
+        tracker.record_invocation("intake")
+
+        assert tracker.invocation_count("intake") == 3

@@ -385,6 +385,54 @@ def build_skill_tool(
 
         # Fork child ONCE — keep alive for the entire verify/fix cycle
         _skill_logger.info("FORK %s — spawning child agent", skill_name)
+
+        def _child_event_handler(event) -> None:
+            """Log child agent events so we can see what the child is doing.
+
+            ``event`` may be a raw SessionEvent object (from the copilot SDK)
+            or a dict — we handle both.
+            """
+            try:
+                # Extract event type — works with both raw objects and dicts
+                if isinstance(event, dict):
+                    raw_type = event.get("type", "")
+                else:
+                    raw_type = getattr(event, "type", "")
+                etype = raw_type.value if hasattr(raw_type, "value") else str(raw_type)
+            except Exception:
+                return
+
+            if etype == "tool.execution_start":
+                if isinstance(event, dict):
+                    data = event.get("data", {})
+                    tool_name = data.get("tool_name", "?") if isinstance(data, dict) else "?"
+                else:
+                    data = getattr(event, "data", None)
+                    tool_name = getattr(data, "tool_name", "?") if data else "?"
+                _skill_logger.info("CHILD %s — tool: %s", skill_name, tool_name)
+            elif etype == "tool.execution_complete":
+                if isinstance(event, dict):
+                    data = event.get("data", {})
+                    tool_name = data.get("tool_name", "?") if isinstance(data, dict) else "?"
+                    error = data.get("error") if isinstance(data, dict) else None
+                else:
+                    data = getattr(event, "data", None)
+                    tool_name = getattr(data, "tool_name", "?") if data else "?"
+                    error = getattr(data, "error", None) if data else None
+                if error:
+                    _skill_logger.warning(
+                        "CHILD %s — tool DONE (error): %s — %s",
+                        skill_name, tool_name, str(error)[:200],
+                    )
+                else:
+                    _skill_logger.info("CHILD %s — tool DONE: %s", skill_name, tool_name)
+            elif etype in ("turn.started", "turn.completed"):
+                _skill_logger.info("CHILD %s — %s", skill_name, etype)
+            elif etype == "session.started":
+                _skill_logger.info("CHILD %s — session started", skill_name)
+            else:
+                _skill_logger.debug("CHILD %s — event: %s", skill_name, etype)
+
         try:
             spec = SubagentSpec(
                 role=f"skill:{skill_name}",
@@ -392,7 +440,7 @@ def build_skill_tool(
                 max_turns=100,  # generous — child may need many turns across retries
                 timeout_seconds=3600.0,  # 1 hour total for skill + retries
             )
-            child = await session.fork_child(spec)
+            child = await session.fork_child(spec, on_event=_child_event_handler)
         except Exception as exc:
             _skill_logger.error("FORK %s — spawn failed: %s", skill_name, exc)
             return ToolResult(
@@ -404,7 +452,10 @@ def build_skill_tool(
             # --- Initial work ---
             _skill_logger.info("FORK %s — child starting work", skill_name)
             try:
-                raw_result = await child.send_and_wait(user_prompt, timeout=1800.0)
+                await child.send_and_wait(user_prompt, timeout=1800.0)
+                raw_result = await child.get_last_response_text()
+                if not raw_result:
+                    raw_result = "(child produced no text response)"
             except Exception as child_exc:
                 _skill_logger.error(
                     "FORK %s — child send_and_wait raised: %s", skill_name, child_exc,
@@ -413,8 +464,6 @@ def build_skill_tool(
                     text_result_for_llm=f"Error: child agent for '{skill_name}' failed: {child_exc}",
                     result_type="error",
                 )
-            if not isinstance(raw_result, str):
-                raw_result = str(raw_result)
             _skill_logger.info(
                 "FORK %s — child finished (%d chars). Output dir exists: %s",
                 skill_name, len(raw_result), verify_output_dir.exists(),
@@ -442,11 +491,12 @@ def build_skill_tool(
                             )
                             raise VerificationExhaustedError(skill_name, trace_path)
                         # Send feedback to SAME child
-                        raw_result = await child.send_and_wait(
+                        await child.send_and_wait(
                             f"Output directory '{outputs_rel}' does not exist. "
                             f"You must write outputs to this directory. Fix this now.",
                             timeout=1800.0,
                         )
+                        raw_result = await child.get_last_response_text()
                         continue
 
                     total_bytes = sum(
@@ -464,11 +514,12 @@ def build_skill_tool(
                                 Path(working_directory),
                             )
                             raise VerificationExhaustedError(skill_name, trace_path)
-                        raw_result = await child.send_and_wait(
+                        await child.send_and_wait(
                             f"Output directory '{outputs_rel}' has only {total_bytes} "
                             f"bytes — this looks like placeholders. Write real outputs.",
                             timeout=1800.0,
                         )
+                        raw_result = await child.get_last_response_text()
                         continue
 
                 # Run verification
@@ -539,13 +590,12 @@ def build_skill_tool(
                         "FAIL %s attempt %d — sending feedback to child",
                         skill_name, attempt_counts,
                     )
-                    raw_result = await child.send_and_wait(
+                    await child.send_and_wait(
                         f"## VERIFICATION FAILED\n\n{feedback}\n\n"
                         f"Fix the issues above and ensure all outputs are correct.",
                         timeout=1800.0,
                     )
-                    if not isinstance(raw_result, str):
-                        raw_result = str(raw_result)
+                    raw_result = await child.get_last_response_text()
                     continue
 
             # Safety net

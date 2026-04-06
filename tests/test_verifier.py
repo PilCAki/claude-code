@@ -385,6 +385,9 @@ class FakeEnforcedChild:
     async def send_and_wait(self, prompt, *, timeout=None):
         return self._output
 
+    async def get_last_response_text(self):
+        return self._output
+
     async def destroy(self):
         pass
 
@@ -532,7 +535,7 @@ class TestRunVerification:
         assert captured_spec is not None
         assert captured_spec.role == "skill-verifier"
         assert captured_spec.max_turns == 20
-        assert captured_spec.timeout_seconds == 300.0
+        assert captured_spec.timeout_seconds == 3600.0
 
 
 # ---------------------------------------------------------------------------
@@ -569,13 +572,18 @@ class TestFullRetryLoop:
         )
 
         class FakeChild:
+            def __init__(self):
+                self._last = ""
             async def send_and_wait(self, prompt, *, timeout=None):
-                return fail_output
+                self._last = fail_output
+                return self._last
+            async def get_last_response_text(self):
+                return self._last
             async def destroy(self):
                 pass
 
         class FakeSession:
-            async def fork_child(self, spec):
+            async def fork_child(self, spec, **kw):
                 return FakeChild()
 
         completed = set()
@@ -635,28 +643,34 @@ class TestFullRetryLoop:
         call_count = [0]
 
         class FakeChild:
+            def __init__(self):
+                self._last = ""
             async def send_and_wait(self, prompt, *, timeout=None):
                 call_count[0] += 1
                 if call_count[0] <= 2:
-                    return (
+                    self._last = (
                         "### Check: broken\n"
                         "**Command run:**\n  echo fail\n"
                         "**Output observed:**\n  fail\n"
                         "**Result: FAIL**\n\n"
                         "VERDICT: FAIL"
                     )
-                return (
-                    "### Check: fixed\n"
-                    "**Command run:**\n  echo ok\n"
-                    "**Output observed:**\n  ok\n"
-                    "**Result: PASS**\n\n"
-                    "VERDICT: PASS"
-                )
+                else:
+                    self._last = (
+                        "### Check: fixed\n"
+                        "**Command run:**\n  echo ok\n"
+                        "**Output observed:**\n  ok\n"
+                        "**Result: PASS**\n\n"
+                        "VERDICT: PASS"
+                    )
+                return self._last
+            async def get_last_response_text(self):
+                return self._last
             async def destroy(self):
                 pass
 
         class FakeSession:
-            async def fork_child(self, spec):
+            async def fork_child(self, spec, **kw):
                 return FakeChild()
 
         completed = set()
@@ -706,13 +720,18 @@ class TestFullRetryLoop:
         (output_dir / "data.json").write_bytes(b"x" * 2000)
 
         class FakeChild:
+            def __init__(self):
+                self._last = ""
             async def send_and_wait(self, prompt, *, timeout=None):
-                return "I looked at the files and they seem fine."
+                self._last = "I looked at the files and they seem fine."
+                return self._last
+            async def get_last_response_text(self):
+                return self._last
             async def destroy(self):
                 pass
 
         class FakeSession:
-            async def fork_child(self, spec):
+            async def fork_child(self, spec, **kw):
                 return FakeChild()
 
         completed = set()

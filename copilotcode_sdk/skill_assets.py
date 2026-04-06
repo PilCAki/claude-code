@@ -389,6 +389,8 @@ def parse_skill_frontmatter(skill_md_path: Path) -> dict[str, str]:
             fields[key] = value
     if "name" not in fields:
         fields["name"] = skill_md_path.parent.name
+    # Store the resolved path so SkillTool can read the full content later
+    fields["_path"] = str(skill_md_path.resolve())
     return fields
 
 
@@ -430,9 +432,9 @@ def build_skill_catalog(
     lines = [
         "## Available Skills",
         "",
-        "The following skills are available in this workspace. Each skill has a SKILL.md",
-        "with full methodology, expected outputs, and quality rubrics. Read the SKILL.md",
-        "before starting work that matches a skill's scope.",
+        "The following skills are available in this workspace. Execute them using the",
+        "**InvokeSkill** tool — it forks an isolated session with the full methodology",
+        "loaded. Do not attempt skill work directly; always use InvokeSkill.",
         "",
         "| Skill | Type | Description | Requires |",
         "|-------|------|-------------|----------|",
@@ -521,3 +523,135 @@ def _build_dependency_chains(ordered: list[dict[str, str]]) -> list[str]:
             in_chain.add(s["name"])
 
     return [" → ".join(chain) for chain in chains if len(chain) > 1]
+
+
+# ---------------------------------------------------------------------------
+# Skill tracker — usage scoring and recency
+# ---------------------------------------------------------------------------
+
+
+class SkillTracker:
+    """Track skill usage for ranking and dynamic surfacing.
+
+    Usage::
+
+        tracker = SkillTracker()
+        tracker.record_invocation("verify")
+        tracker.record_completion("verify")
+        ranked = tracker.rank(skill_map, completed_skills)
+    """
+
+    def __init__(self) -> None:
+        self._invocations: dict[str, int] = {}
+        self._completions: dict[str, int] = {}
+        self._last_used_turn: dict[str, int] = {}
+        self._current_turn: int = 0
+
+    def advance_turn(self) -> None:
+        """Call once per turn to advance the recency clock."""
+        self._current_turn += 1
+
+    @property
+    def current_turn(self) -> int:
+        return self._current_turn
+
+    def record_invocation(self, skill_name: str) -> None:
+        """Record that a skill was invoked (e.g. via shorthand)."""
+        self._invocations[skill_name] = self._invocations.get(skill_name, 0) + 1
+        self._last_used_turn[skill_name] = self._current_turn
+
+    def record_completion(self, skill_name: str) -> None:
+        """Record that a skill was completed."""
+        self._completions[skill_name] = self._completions.get(skill_name, 0) + 1
+        self._last_used_turn[skill_name] = self._current_turn
+
+    def invocation_count(self, skill_name: str) -> int:
+        return self._invocations.get(skill_name, 0)
+
+    def completion_count(self, skill_name: str) -> int:
+        return self._completions.get(skill_name, 0)
+
+    def last_used_turn(self, skill_name: str) -> int:
+        return self._last_used_turn.get(skill_name, -1)
+
+    def score(
+        self,
+        skill_name: str,
+        skill_map: dict[str, dict[str, str]],
+        completed_skills: set[str],
+    ) -> float:
+        """Score a skill for surfacing priority.
+
+        Higher score = more likely to be surfaced.  Factors:
+        - Prerequisites met → +10
+        - Not yet completed → +5
+        - Recency decay: recently used skills score lower (avoid nagging)
+        - Never invoked → +3 (discovery bonus)
+        """
+        fm = skill_map.get(skill_name, {})
+        score = 0.0
+
+        # Prerequisite check
+        requires = fm.get("requires", "").strip().lower()
+        if not requires or requires == "none":
+            score += 10.0  # no prereqs = always available
+        else:
+            # Check if prerequisite type is satisfied
+            completed_types = {
+                skill_map.get(s, {}).get("type", "").strip().lower()
+                for s in completed_skills
+            }
+            if requires in completed_types:
+                score += 10.0  # prereqs met
+            else:
+                score -= 20.0  # prereqs not met, strongly deprioritize
+
+        # Completion status
+        if skill_name not in completed_skills:
+            score += 5.0
+
+        # Discovery bonus — never invoked skills get a nudge
+        if self.invocation_count(skill_name) == 0:
+            score += 3.0
+
+        # Recency penalty — recently used skills are less urgent
+        last = self.last_used_turn(skill_name)
+        if last >= 0:
+            turns_ago = self._current_turn - last
+            if turns_ago < 5:
+                score -= 3.0  # used very recently
+            elif turns_ago < 15:
+                score -= 1.0  # used somewhat recently
+
+        return score
+
+    def rank(
+        self,
+        skill_map: dict[str, dict[str, str]],
+        completed_skills: set[str],
+    ) -> list[tuple[str, float]]:
+        """Rank all skills by surfacing priority, highest first.
+
+        Returns list of ``(skill_name, score)`` tuples.
+        """
+        scored = [
+            (name, self.score(name, skill_map, completed_skills))
+            for name in skill_map
+        ]
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        return scored
+
+    def top_surfaceable(
+        self,
+        skill_map: dict[str, dict[str, str]],
+        completed_skills: set[str],
+        *,
+        limit: int = 3,
+        min_score: float = 0.0,
+    ) -> list[str]:
+        """Return the top skills that should be surfaced to the agent."""
+        ranked = self.rank(skill_map, completed_skills)
+        return [
+            name for name, sc in ranked
+            if sc >= min_score and name not in completed_skills
+        ][:limit]

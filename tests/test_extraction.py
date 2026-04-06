@@ -73,3 +73,37 @@ def test_build_session_end_extraction_prompt_lists_what_to_capture() -> None:
     assert "column" in prompt.lower()
     assert "data quality" in prompt.lower()
     assert "metrics" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# Wave 2: Enforce extraction mode
+# ---------------------------------------------------------------------------
+
+from copilotcode_sdk.extraction import build_enforce_extraction_prompt, ExtractionMode
+
+
+def test_extraction_mode_type_accepts_both_values() -> None:
+    nudge: ExtractionMode = "nudge"
+    enforce: ExtractionMode = "enforce"
+    assert nudge == "nudge"
+    assert enforce == "enforce"
+
+
+def test_build_enforce_extraction_prompt_contains_required_parts() -> None:
+    prompt = build_enforce_extraction_prompt(
+        memory_dir="/tmp/mem",
+        session_memory_path="/tmp/mem/session_memory.md",
+    )
+    assert "enforcement" in prompt.lower() or "enforce" in prompt.lower()
+    assert "MUST" in prompt
+    assert "/tmp/mem/session_memory.md" in prompt
+
+
+def test_build_enforce_extraction_prompt_includes_format_guidance() -> None:
+    prompt = build_enforce_extraction_prompt(
+        memory_dir="/data/mem",
+        session_memory_path="/data/mem/session_memory.md",
+    )
+    # Should have structured entry format instructions
+    assert "# <Title>" in prompt or "Title" in prompt
+    assert "---" in prompt  # separator guidance

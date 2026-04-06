@@ -1,21 +1,54 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Any
 
+import time
+
+from .compaction import build_handoff_context
 from .config import CopilotCodeConfig, DEFAULT_SKILL_NAMES
-from .extraction import should_extract, build_extraction_prompt, build_session_end_extraction_prompt
-from .instructions import load_workspace_instructions
+from .extraction import should_extract, build_extraction_prompt, build_enforce_extraction_prompt, build_session_end_extraction_prompt
+from .instructions import InstructionBundle, load_workspace_instructions
+from .mcp import build_mcp_delta, MCPLifecycleManager
 from .memory import MemoryStore
+from .prompt_compiler import PromptAssembler
+from .skill_assets import SkillTracker
+from .suggestions import build_prompt_suggestions, format_suggestions_prompt
 from .tasks import TaskStore
+from .retry import RetryPolicy, RetryState, build_retry_response
+from .token_budget import TokenBudget, parse_token_budget, strip_budget_directive, format_budget_status
 
 SUGGESTION_TURN_THRESHOLD = 3
 SUGGESTION_INTERVAL = 15
 
+# Auto-compaction context tracking
+DEFAULT_CONTEXT_WARNING_THRESHOLD = 0.80
+DEFAULT_CONTEXT_CRITICAL_THRESHOLD = 0.95
+DEFAULT_MAX_CONTEXT_CHARS = 800_000  # ~200K tokens at 4 chars/token
+
 TASK_TOOL_NAMES = {"taskcreate", "taskupdate", "tasklist", "taskget"}
+
+def _ensure_dict(obj: Any) -> Any:
+    """Convert SessionEvent-like objects to dicts so isinstance checks work.
+
+    If *obj* has a ``to_dict`` method (e.g. SessionEvent dataclass wrappers),
+    call it.  Otherwise return *obj* unchanged.
+    """
+    if obj is None or isinstance(obj, (dict, str, int, float, bool, list)):
+        return obj
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    # Fallback: try vars() for plain dataclasses / attrs
+    try:
+        return vars(obj)
+    except TypeError:
+        return obj
+
 
 PATH_KEYS = ("path", "file", "dir", "directory", "cwd", "workspace")
 SHELL_TOOL_NAMES = {"bash", "shell", "execute", "powershell"}
@@ -28,6 +61,28 @@ NOISY_TOOL_NAMES = {
     "read",
 }
 WRITE_TOOL_NAMES = {"write_file", "write", "edit", "create_file"}
+READ_TOOL_NAMES = {"read", "read_file", "view", "cat"}
+DELETE_TOOL_NAMES = {"delete", "rm", "remove"}
+# Tools whose results are safe to cache (pure reads, no side effects)
+CACHEABLE_TOOL_NAMES = {"glob", "grep", "search_codebase", "read", "read_file", "view"}
+
+# Tool result persistence threshold (chars)
+DEFAULT_PERSIST_THRESHOLD = 50_000
+PREVIEW_SIZE = 2_000
+
+# Git safety: dangerous patterns that should be denied or warned about
+GIT_DANGEROUS_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\bgit\s+push\s+.*--force\b", "git push --force can overwrite remote history"),
+    (r"\bgit\s+push\s+-f\b", "git push -f can overwrite remote history"),
+    (r"\bgit\s+reset\s+--hard\b", "git reset --hard discards all uncommitted changes"),
+    (r"\bgit\s+checkout\s+--\s+\.", "git checkout -- . discards all uncommitted changes"),
+    (r"\bgit\s+clean\s+-[a-zA-Z]*f", "git clean -f permanently deletes untracked files"),
+    (r"\bgit\s+branch\s+-D\b", "git branch -D force-deletes a branch without merge check"),
+    (r"\bgit\s+stash\s+drop\b", "git stash drop permanently removes stashed changes"),
+    (r"\bgit\s+rebase\s.*-i\b", "git rebase -i requires interactive input (not supported)"),
+    (r"\bgit\s+add\s+-i\b", "git add -i requires interactive input (not supported)"),
+    (r"--no-verify", "--no-verify skips safety hooks"),
+)
 
 
 def _parse_hook_action(raw: str) -> tuple[str, str]:
@@ -96,80 +151,16 @@ def _check_skill_completion(
     completed_skills: set[str],
     fired_one_shots: set[str] | None = None,
 ) -> str | None:
-    """Check if a tool call's output path matches a skill's outputs pattern.
+    """Passive skill-completion detection — DISABLED.
 
-    Returns an additionalContext nudge string, or None.
-    Fires ``on_complete`` frontmatter actions when a skill completes.
+    Skill completion is now handled exclusively by the CompleteSkill tool.
+    The model must explicitly call CompleteSkill after finishing a skill's
+    work; writing files to the output directory does NOT mark a skill
+    as complete.
+
+    This function is kept as a no-op to preserve the call-site contract.
     """
-    if tool_name.lower() not in WRITE_TOOL_NAMES:
-        return None
-    if not isinstance(tool_args, dict):
-        return None
-
-    written_path = ""
-    for key in ("path", "filePath", "file_path", "file"):
-        if key in tool_args:
-            written_path = str(tool_args[key])
-            break
-    if not written_path:
-        return None
-
-    # Normalize to forward slashes for matching
-    written_lower = written_path.replace("\\", "/").lower()
-
-    for skill_name, fm in skill_map.items():
-        if skill_name in completed_skills:
-            continue
-        outputs = fm.get("outputs", "")
-        if not outputs:
-            continue
-        # Extract just the path portion (before descriptive text, placeholders, or parens)
-        output_path = outputs.split("(")[0].split("<")[0].strip()
-        # If it still has spaces, take only the first token (the path)
-        if " " in output_path:
-            output_path = output_path.split()[0]
-        # Normalize output pattern
-        output_pattern = output_path.replace("\\", "/").lower().rstrip("/")
-        # Check if the written path contains the output pattern
-        if output_pattern and output_pattern in written_lower:
-            completed_skills.add(skill_name)
-
-            # Fire on_complete frontmatter action if present
-            on_complete_raw = fm.get("on_complete", "")
-            if on_complete_raw:
-                is_one_shot = fm.get("one_shot", "").lower() in ("true", "yes", "1")
-                one_shot_key = f"{skill_name}:on_complete"
-                if is_one_shot and fired_one_shots is not None and one_shot_key in fired_one_shots:
-                    pass  # Already fired
-                else:
-                    if fired_one_shots is not None:
-                        fired_one_shots.add(one_shot_key)
-                    action_type, payload = _parse_hook_action(on_complete_raw)
-                    action_result = _execute_hook_action(action_type, payload, skill_name)
-                    if action_result:
-                        return action_result.get("additionalContext")
-
-            # Find downstream skills
-            skill_type = fm.get("type", "")
-            downstream = [
-                s["name"]
-                for s in skill_map.values()
-                if s.get("requires") == skill_type and s["name"] not in completed_skills
-            ] if skill_type else []
-            parts = [
-                f"You appear to have completed the **{skill_name}** skill.",
-            ]
-            if downstream:
-                names = ", ".join(downstream)
-                parts.append(
-                    f"Check the skill catalog \u2014 the following downstream skills may now be triggered: {names}. "
-                    "Read their SKILL.md files for methodology."
-                )
-            else:
-                parts.append(
-                    "Check the skill catalog for any remaining skills."
-                )
-            return " ".join(parts)
+    return None
 
     return None
 
@@ -186,11 +177,16 @@ def _build_skill_reminder(
         if len(desc) > 60:
             desc = desc[:57] + "..."
         lines.append(f"- {name} [{status}]: {desc}")
-    lines.append("")
-    lines.append(
-        "After completing a skill, check if downstream skills should be triggered next. "
-        "Do not stop if there are remaining skills whose prerequisites are now met."
-    )
+    not_done = [n for n in skill_map if n not in completed_skills]
+    if not_done:
+        lines.append("")
+        lines.append(
+            f"Skills remaining: **{', '.join(not_done)}**. "
+            "Use InvokeSkill to execute the next skill whose prerequisites are met."
+        )
+    else:
+        lines.append("")
+        lines.append("All skills complete.")
     return "\n".join(lines)
 
 
@@ -200,6 +196,9 @@ def build_default_hooks(
     *,
     skill_map: dict[str, dict[str, str]] | None = None,
     task_store: TaskStore | None = None,
+    assembler: PromptAssembler | None = None,
+    completed_skills: set[str] | None = None,
+    session_memory_controller: Any | None = None,
 ) -> dict[str, Any]:
     allowed_roots = tuple(
         path.resolve(strict=False)
@@ -211,14 +210,38 @@ def build_default_hooks(
 
     # Ring buffer for shell command repeat detection (anti-loop).
     _recent_shell: list[tuple[str, str]] = []
-    _completed_skills: set[str] = set()
+    _recent_tool_names: list[str] = []
+    _completed_skills: set[str] = completed_skills if completed_skills is not None else set()
     _fired_one_shots: set[str] = set()
+    _loaded_instructions: list[InstructionBundle] = []
+    _skill_tracker = SkillTracker() if skill_map else None
     _tool_call_count = [0]  # mutable counter in list for closure
     _last_extraction_turn = [0]
     _last_suggestion_turn = [0]
     _total_result_chars = [0]
     _turns_since_task_use = [0]
     _last_task_reminder_turn = [0]
+    _read_file_state: dict[str, float] = {}  # path → timestamp of last read
+    _tool_results_dir: Path | None = None
+    _estimated_context_chars = [0]  # cumulative estimate of context size
+    _compaction_warned = [False]  # whether we've already warned about context size
+    _token_budget: list[TokenBudget | None] = [None]  # active token budget from user directive
+    _budget_warning_fired = [False]
+    _tool_result_cache: dict[str, str] = {}  # hash(tool_name+args) → result
+    _file_changes: dict[str, str] = {}  # path → "created" | "modified" | "deleted"
+    _active_paths: set[str] = set()  # paths touched by tool operations (reads + writes)
+    _pending_skill_invocations: list[dict[str, Any]] = []  # queued InvokeSkill invocations
+    _mcp_manager: MCPLifecycleManager | None = (
+        MCPLifecycleManager(list(config.mcp_servers)) if config.mcp_servers else None
+    )
+    _retry_policy = RetryPolicy(
+        base_delay_ms=config.retry_base_delay_ms,
+        max_delay_ms=config.retry_max_delay_ms,
+        max_attempts=config.retry_max_attempts,
+        jitter=config.retry_jitter,
+    )
+    # Per-error-context retry states (reset after success)
+    _retry_states: dict[str, RetryState] = {}
 
     def on_session_start(
         input_data: dict[str, Any],
@@ -230,7 +253,15 @@ def build_default_hooks(
             f"{config.brand.public_name} is active for `{memory_store.project_root}`.",
         ]
         if config.include_workspace_instruction_snippets:
-            instruction_bundle = load_workspace_instructions(config.working_path)
+            # Pass active_paths from input_data for path-conditional rule filtering
+            active_paths_raw = input_data.get("active_paths") or []
+            active_paths = [Path(p) for p in active_paths_raw] if active_paths_raw else None
+            instruction_bundle = load_workspace_instructions(
+                config.working_path,
+                active_paths=active_paths,
+                on_loaded=lambda b: _loaded_instructions.append(b),
+                user_config_dir=config.app_config_home,
+            )
             if instruction_bundle.content:
                 parts.append(instruction_bundle.content)
         if config.enable_hybrid_memory:
@@ -248,13 +279,75 @@ def build_default_hooks(
             if config.enable_hybrid_memory:
                 _write_prior_run_memory(memory_store, config.working_path)
 
+        # Inject non-cacheable prompt sections (skill catalog, MCP servers, etc.)
+        if assembler is not None:
+            dynamic_content = assembler.render_dynamic()
+            if dynamic_content:
+                parts.append(dynamic_content)
+
+        # MCP server context — use instruction delta tracking when manager is available
+        if config.mcp_servers:
+            if _mcp_manager is not None:
+                mcp_context = _mcp_manager.build_instruction_delta(config.mcp_servers)
+                _mcp_manager.mark_delta_emitted()
+            else:
+                mcp_context = build_mcp_delta(config.mcp_servers)
+            if mcp_context:
+                parts.append(mcp_context)
+
+        # Store instruction bundle for client capture
+        if _loaded_instructions:
+            pass  # captured via closure; client reads from hook result below
+
         result: dict[str, Any] = {"additionalContext": "\n\n".join(parts)}
+
+        # Expose loaded instructions for client capture
+        if _loaded_instructions:
+            result["_instructionsLoaded"] = _loaded_instructions[0]
 
         # On resume with open tasks, inject an initial user message nudge
         if source == "resume" and task_store is not None and task_store.has_open_tasks():
             result["initialUserMessage"] = (
                 "Session resumed. Check TaskList for open tasks and continue where you left off."
             )
+
+        # On resume, inject compaction handoff artifact if available
+        if source == "resume":
+            compaction_dir = memory_store.memory_dir / "compaction"
+            if compaction_dir.is_dir():
+                artifact_path = None
+                # Try session-specific artifact first
+                resume_session_id = input_data.get("session_id")
+                if resume_session_id:
+                    candidate = compaction_dir / f"{resume_session_id}.md"
+                    if candidate.is_file():
+                        artifact_path = candidate
+                # Fall back to most-recent artifact
+                if artifact_path is None:
+                    artifacts = sorted(compaction_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if artifacts:
+                        artifact_path = artifacts[0]
+                if artifact_path is not None:
+                    try:
+                        summary = artifact_path.read_text(encoding="utf-8")
+                        if summary.strip():
+                            # Populate memory index for richer handoff context
+                            _memory_index = ""
+                            try:
+                                idx_path = memory_store.index_path
+                                if idx_path.exists():
+                                    _memory_index = idx_path.read_text(encoding="utf-8")
+                            except OSError:
+                                pass
+                            handoff = build_handoff_context(
+                                compaction_summary=summary,
+                                memory_index=_memory_index,
+                            )
+                            # Prepend to existing additionalContext
+                            existing = result.get("additionalContext", "")
+                            result["additionalContext"] = handoff + "\n\n" + existing if existing else handoff
+                    except OSError:
+                        pass
 
         # Watched paths: monitor instruction files for changes
         watched: list[str] = []
@@ -279,6 +372,17 @@ def build_default_hooks(
         modified_prompt = _expand_skill_shorthand(prompt) if config.enable_skill_shorthand else prompt
         additional_parts: list[str] = []
 
+        # Parse token budget directives (+500k, +1.5m, "use 500k tokens")
+        if _token_budget[0] is None:
+            budget = parse_token_budget(modified_prompt)
+            if budget is not None:
+                _token_budget[0] = budget
+                modified_prompt = strip_budget_directive(modified_prompt)
+                additional_parts.append(
+                    f"Token budget set: {budget.tokens:,} tokens. "
+                    "Work efficiently within this budget."
+                )
+
         if config.enable_hybrid_memory:
             memory_context = memory_store.build_relevant_context(modified_prompt or prompt)
             if memory_context:
@@ -288,6 +392,8 @@ def build_default_hooks(
         if modified_prompt != prompt and skill_map:
             invoked_skill = _extract_skill_name_from_prompt(modified_prompt)
             if invoked_skill and invoked_skill in skill_map:
+                if _skill_tracker is not None:
+                    _skill_tracker.record_invocation(invoked_skill)
                 fm = skill_map[invoked_skill]
                 on_start_raw = fm.get("on_start", "")
                 if on_start_raw:
@@ -312,7 +418,7 @@ def build_default_hooks(
         _: dict[str, str],
     ) -> dict[str, Any] | None:
         tool_name = str(input_data.get("toolName", "")).lower()
-        tool_args = input_data.get("toolArgs")
+        tool_args = _ensure_dict(input_data.get("toolArgs"))
         response: dict[str, Any] = {}
 
         violating_path = _find_disallowed_path(
@@ -325,6 +431,63 @@ def build_default_hooks(
             response["permissionDecisionReason"] = (
                 f"Path `{violating_path}` is outside the workspace, app config, and memory roots managed by {config.brand.public_name}."
             )
+
+        # UNC path rejection (prevents NTLM credential leaks on Windows)
+        if isinstance(tool_args, dict):
+            for key in ("path", "filePath", "file_path", "file"):
+                val = tool_args.get(key, "")
+                if isinstance(val, str) and (val.startswith("\\\\") or val.startswith("//")):
+                    response["permissionDecision"] = "deny"
+                    response["permissionDecisionReason"] = (
+                        f"UNC paths (\\\\...) are not allowed to prevent credential leaks."
+                    )
+                    break
+
+        # Read-before-write enforcement
+        if config.enforce_read_before_write and tool_name in WRITE_TOOL_NAMES and isinstance(tool_args, dict):
+            write_path = ""
+            for key in ("path", "filePath", "file_path", "file"):
+                if key in tool_args:
+                    write_path = str(tool_args[key])
+                    break
+            if write_path:
+                resolved = _resolve_path(write_path, config.working_path)
+                # Only enforce for existing files (new file creation is fine)
+                if resolved.exists() and str(resolved) not in _read_file_state:
+                    response["additionalContext"] = (
+                        f"Warning: You are writing to `{write_path}` without reading it first. "
+                        "Read the file before modifying it to understand existing code."
+                    )
+
+        # Git safety protocol: detect dangerous git commands
+        if tool_name in SHELL_TOOL_NAMES and isinstance(tool_args, dict):
+            cmd = str(tool_args.get("command", ""))
+            for pattern, reason in GIT_DANGEROUS_PATTERNS:
+                if re.search(pattern, cmd, re.IGNORECASE):
+                    response["permissionDecision"] = "deny"
+                    response["permissionDecisionReason"] = (
+                        f"Blocked dangerous command: {reason}. "
+                        "Use a safer alternative or ask the user for explicit permission."
+                    )
+                    break
+
+        # Tool result cache: return cached result for identical read-only calls
+        if (
+            config.enable_tool_result_cache
+            and tool_name in CACHEABLE_TOOL_NAMES
+            and isinstance(tool_args, dict)
+            and "permissionDecision" not in response
+        ):
+            cache_key = _tool_cache_key(tool_name, tool_args)
+            if cache_key in _tool_result_cache:
+                response["modifiedResult"] = {
+                    "cached": True,
+                    "content": _tool_result_cache[cache_key],
+                }
+                response["additionalContext"] = (
+                    "Returned cached result for identical tool call."
+                )
+                return response
 
         if tool_name in SHELL_TOOL_NAMES and isinstance(tool_args, dict):
             modified_args = deepcopy(tool_args)
@@ -340,9 +503,181 @@ def build_default_hooks(
         _: dict[str, str],
     ) -> dict[str, Any] | None:
         tool_name = str(input_data.get("toolName", "")).lower()
-        tool_args = input_data.get("toolArgs")
-        tool_result = input_data.get("toolResult")
+        tool_args = _ensure_dict(input_data.get("toolArgs"))
+        tool_result = _ensure_dict(input_data.get("toolResult"))
         _tool_call_count[0] += 1
+
+        # Detect InvokeSkill results and queue for async execution
+        if tool_name == "invokeskill":
+            result_str = _stringify_result(tool_result)
+            try:
+                parsed = json.loads(result_str) if isinstance(result_str, str) else tool_result
+                invocation = parsed.get("_invocation") if isinstance(parsed, dict) else None
+                if invocation and isinstance(invocation, dict):
+                    _pending_skill_invocations.append(invocation)
+                    skill_name = invocation.get("skill_name", "unknown")
+                    return {
+                        "additionalContext": (
+                            f"Skill **{skill_name}** invocation queued. "
+                            "Execution will begin shortly in a child session. "
+                            "Continue with other work or wait for results."
+                        ),
+                    }
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass  # malformed result — fall through to normal processing
+
+        # Increment SMC tool-call counter for mid-session extraction thresholds
+        if session_memory_controller is not None:
+            session_memory_controller.record_tool_call()
+
+        # Track estimated context size for auto-compaction warnings
+        result_text_len = len(_stringify_result(input_data.get("toolResult")))
+        _estimated_context_chars[0] += result_text_len
+        max_context = DEFAULT_MAX_CONTEXT_CHARS
+        infinite_cfg = config.resolved_infinite_session_config()
+        if infinite_cfg.get("enabled"):
+            warning_threshold = infinite_cfg.get(
+                "background_compaction_threshold", DEFAULT_CONTEXT_WARNING_THRESHOLD,
+            )
+            critical_threshold = infinite_cfg.get(
+                "buffer_exhaustion_threshold", DEFAULT_CONTEXT_CRITICAL_THRESHOLD,
+            )
+        else:
+            warning_threshold = DEFAULT_CONTEXT_WARNING_THRESHOLD
+            critical_threshold = DEFAULT_CONTEXT_CRITICAL_THRESHOLD
+
+        context_ratio = _estimated_context_chars[0] / max_context if max_context > 0 else 0
+        if context_ratio >= critical_threshold and not _compaction_warned[0]:
+            _compaction_warned[0] = True
+            return {
+                "additionalContext": (
+                    "<system-reminder>\n"
+                    "CRITICAL: Context window is nearly exhausted "
+                    f"(~{context_ratio:.0%} of estimated capacity). "
+                    "You MUST save your progress immediately:\n"
+                    "1. Update all task statuses\n"
+                    "2. Save any unsaved learnings to memory\n"
+                    "3. Produce a handoff summary of current work state\n"
+                    "The session may be compacted or terminated soon.\n"
+                    "</system-reminder>"
+                ),
+            }
+        if context_ratio >= warning_threshold and not _compaction_warned[0]:
+            _compaction_warned[0] = True
+            return {
+                "additionalContext": (
+                    "<system-reminder>\n"
+                    "Context window is approaching capacity "
+                    f"(~{context_ratio:.0%} of estimated limit). "
+                    "Consider saving important findings to memory and "
+                    "updating task statuses. Focus on completing current work "
+                    "efficiently — avoid large exploratory reads.\n"
+                    "</system-reminder>"
+                ),
+            }
+
+        # Token budget consumption tracking
+        if _token_budget[0] is not None:
+            # Estimate tokens consumed this turn (~4 chars/token for result)
+            _token_budget[0].consumed += result_text_len // 4
+            budget = _token_budget[0]
+            if budget.exhausted and not _budget_warning_fired[0]:
+                _budget_warning_fired[0] = True
+                return {
+                    "additionalContext": (
+                        "<system-reminder>\n"
+                        f"Token budget EXHAUSTED. {format_budget_status(budget)} "
+                        "Wrap up your current task immediately and report results.\n"
+                        "</system-reminder>"
+                    ),
+                }
+            if budget.progress >= 0.80 and not _budget_warning_fired[0]:
+                _budget_warning_fired[0] = True
+                return {
+                    "additionalContext": (
+                        "<system-reminder>\n"
+                        f"{format_budget_status(budget)} "
+                        "Approaching budget limit — prioritize finishing current work.\n"
+                        "</system-reminder>"
+                    ),
+                }
+
+        # Track read files for read-before-write enforcement and active paths
+        if tool_name in READ_TOOL_NAMES and isinstance(tool_args, dict):
+            for key in ("path", "filePath", "file_path", "file"):
+                if key in tool_args:
+                    resolved = _resolve_path(str(tool_args[key]), config.working_path)
+                    _read_file_state[str(resolved)] = time.monotonic()
+                    _active_paths.add(str(resolved))
+                    break
+
+        # Populate tool result cache for cacheable tools
+        if (
+            config.enable_tool_result_cache
+            and tool_name in CACHEABLE_TOOL_NAMES
+            and isinstance(tool_args, dict)
+        ):
+            result_str = _stringify_result(tool_result)
+            if result_str:
+                cache_key = _tool_cache_key(tool_name, tool_args)
+                _tool_result_cache[cache_key] = result_str
+                # Evict oldest entries if cache is too large
+                if len(_tool_result_cache) > config.tool_result_cache_max_size:
+                    oldest = next(iter(_tool_result_cache))
+                    del _tool_result_cache[oldest]
+
+        # File change tracking
+        if isinstance(tool_args, dict):
+            for key in ("path", "filePath", "file_path", "file"):
+                if key in tool_args:
+                    file_path = str(tool_args[key])
+                    resolved = str(_resolve_path(file_path, config.working_path))
+                    if tool_name in WRITE_TOOL_NAMES:
+                        if resolved not in _file_changes:
+                            _file_changes[resolved] = "created"
+                        else:
+                            _file_changes[resolved] = "modified"
+                        _active_paths.add(resolved)
+                    elif tool_name in DELETE_TOOL_NAMES:
+                        _file_changes[resolved] = "deleted"
+                    break
+            # Invalidate cache when files change (writes invalidate reads of same path)
+            if config.enable_tool_result_cache and tool_name in WRITE_TOOL_NAMES:
+                # Clear all cached reads — file state has changed
+                _tool_result_cache.clear()
+
+        # Mark git context stale when git-mutating commands are detected
+        if assembler is not None and tool_name in ("bash", "shell", "execute"):
+            cmd = str(tool_args.get("command", "")) if isinstance(tool_args, dict) else ""
+            _GIT_MUTATING = ("git checkout", "git commit", "git merge", "git rebase", "git pull", "git switch")
+            if any(gc in cmd for gc in _GIT_MUTATING):
+                assembler.mark_stale("git_context")
+
+        # MCP server health tracking: detect MCP tool calls by prefix
+        if _mcp_manager is not None and tool_name.startswith("mcp__"):
+            # Extract server name: mcp__<server>__<tool>
+            parts = tool_name.split("__", 2)
+            if len(parts) >= 2:
+                server_name = parts[1]
+                if _tool_result_failed(tool_result):
+                    _mcp_manager.record_failure(server_name, _stringify_result(tool_result)[:200])
+                else:
+                    _mcp_manager.record_success(server_name)
+                # Inject health warning only when server state actually changed
+                if _mcp_manager.has_changes():
+                    health_prompt = _mcp_manager.build_status_prompt()
+                    if health_prompt:
+                        _mcp_manager.mark_delta_emitted()
+                        return {"additionalContext": health_prompt}
+
+        # Track recent tool names for suggestions
+        _recent_tool_names.append(tool_name)
+        if len(_recent_tool_names) > 20:
+            _recent_tool_names.pop(0)
+
+        # Advance skill tracker turn
+        if _skill_tracker is not None:
+            _skill_tracker.advance_turn()
 
         result_text = _stringify_result(tool_result)
 
@@ -353,6 +688,12 @@ def build_default_hooks(
                 fired_one_shots=_fired_one_shots,
             )
             if nudge:
+                # Record completion in skill tracker
+                if _skill_tracker is not None:
+                    for s in _completed_skills:
+                        if _skill_tracker.completion_count(s) == 0:
+                            _skill_tracker.record_completion(s)
+
                 # Programmatic memory: record skill completion
                 if config.enable_hybrid_memory:
                     _write_skill_completion_memory(
@@ -373,7 +714,7 @@ def build_default_hooks(
         _total_result_chars[0] += len(result_text)
 
         # Memory extraction check
-        if config.enable_hybrid_memory and should_extract(
+        if config.enable_hybrid_memory and not config.session_memory_auto and should_extract(
             tool_call_count=_tool_call_count[0],
             total_chars=_total_result_chars[0],
             last_extraction_turn=_last_extraction_turn[0],
@@ -384,10 +725,16 @@ def build_default_hooks(
         ):
             _last_extraction_turn[0] = _tool_call_count[0]
             _total_result_chars[0] = 0
-            extraction_prompt = build_extraction_prompt(
-                memory_dir=str(memory_store.memory_dir),
-                project_root=str(memory_store.project_root),
-            )
+            if config.extraction_mode == "enforce":
+                extraction_prompt = build_enforce_extraction_prompt(
+                    memory_dir=str(memory_store.memory_dir),
+                    session_memory_path=str(memory_store.session_memory_path),
+                )
+            else:
+                extraction_prompt = build_extraction_prompt(
+                    memory_dir=str(memory_store.memory_dir),
+                    project_root=str(memory_store.project_root),
+                )
             return {"additionalContext": extraction_prompt}
 
         # System-reminder reinjection every N tool calls
@@ -401,6 +748,27 @@ def build_default_hooks(
 
         if not result_text:
             return None
+
+        # Large result persistence: persist to disk, send preview
+        if len(result_text) > DEFAULT_PERSIST_THRESHOLD:
+            persisted_path = _persist_tool_result(
+                config, result_text, tool_name, _tool_call_count[0],
+            )
+            if persisted_path is not None:
+                preview = result_text[:PREVIEW_SIZE].rstrip()
+                return {
+                    "modifiedResult": {
+                        "persisted": True,
+                        "originalLength": len(result_text),
+                        "persistedPath": str(persisted_path),
+                        "content": preview,
+                    },
+                    "additionalContext": (
+                        f"Tool result was {len(result_text):,} chars — persisted to "
+                        f"`{persisted_path}`. Only the first {PREVIEW_SIZE} chars are shown above. "
+                        "Read the persisted file if you need the full output."
+                    ),
+                }
 
         if tool_name in NOISY_TOOL_NAMES and len(result_text) > config.noisy_tool_char_limit:
             truncated = result_text[: config.noisy_tool_char_limit].rstrip() + "..."
@@ -425,8 +793,8 @@ def build_default_hooks(
         # Repeat detection for shell commands
         if tool_name in SHELL_TOOL_NAMES:
             cmd = ""
-            if isinstance(input_data.get("toolArgs"), dict):
-                cmd = str(input_data["toolArgs"].get("command", ""))
+            if isinstance(tool_args, dict):
+                cmd = str(tool_args.get("command", ""))
             sig = (cmd, result_text[:500])
             repeat_count = _recent_shell.count(sig)
             _recent_shell.append(sig)
@@ -471,22 +839,50 @@ def build_default_hooks(
                 ),
             }
 
-        # Prompt suggestion: nudge toward available skills
+        # Prompt suggestion: nudge toward available skills and next actions
         if (
-            skill_map
-            and _tool_call_count[0] > SUGGESTION_TURN_THRESHOLD
+            _tool_call_count[0] > SUGGESTION_TURN_THRESHOLD
             and _tool_call_count[0] - _last_suggestion_turn[0] >= SUGGESTION_INTERVAL
         ):
-            suggestable = _find_suggestable_skills(skill_map, _completed_skills)
-            if suggestable:
+            open_tasks = task_store.list_open() if task_store else []
+            completed_task_count = (
+                sum(1 for t in task_store.list_all() if t.status.value == "completed")
+                if task_store else 0
+            )
+            suggestions = build_prompt_suggestions(
+                skill_map=skill_map or {},
+                completed_skills=_completed_skills,
+                open_tasks=open_tasks,
+                completed_task_count=completed_task_count,
+                session_turn=_tool_call_count[0],
+                recent_tools=_recent_tool_names,
+            )
+            if suggestions:
                 _last_suggestion_turn[0] = _tool_call_count[0]
-                names = ", ".join(suggestable)
-                return {
-                    "additionalContext": (
-                        f"Reminder: the following skills are available and their prerequisites are met: {names}. "
-                        "Check the skill catalog if you haven't started these yet."
-                    ),
-                }
+                formatted = format_suggestions_prompt(suggestions)
+                return {"additionalContext": formatted}
+            # Fallback to simple skill suggestions via tracker
+            if skill_map:
+                if _skill_tracker is not None:
+                    suggestable = _skill_tracker.top_surfaceable(skill_map, _completed_skills)
+                else:
+                    suggestable = _find_suggestable_skills(skill_map, _completed_skills)
+                if suggestable:
+                    _last_suggestion_turn[0] = _tool_call_count[0]
+                    names = ", ".join(suggestable)
+                    return {
+                        "additionalContext": (
+                            f"Reminder: the following skills are available and their prerequisites are met: {names}. "
+                            "Check the skill catalog if you haven't started these yet."
+                        ),
+                    }
+
+        # Refresh stale dynamic sections (e.g., git context after checkout)
+        if assembler is not None and assembler.has_stale_sections():
+            refreshed_dynamic = assembler.render_dynamic()
+            assembler._stale_sections.clear()
+            if refreshed_dynamic:
+                return {"additionalContext": refreshed_dynamic}
 
         return None
 
@@ -497,12 +893,44 @@ def build_default_hooks(
         recoverable = bool(input_data.get("recoverable"))
         error_context = str(input_data.get("errorContext", ""))
         if not recoverable:
+            # Clear retry state on non-recoverable — nothing to retry
+            _retry_states.pop(error_context, None)
             return {"errorHandling": "abort"}
-        if error_context == "model_call":
-            return {"errorHandling": "retry", "retryCount": 1}
         if error_context == "tool_execution":
+            # Tool errors are skipped, not retried
+            _retry_states.pop(error_context, None)
             return {"errorHandling": "skip"}
-        return {"errorHandling": "retry", "retryCount": 1}
+        # Model call and other recoverable errors: exponential backoff
+        if error_context not in _retry_states:
+            _retry_states[error_context] = RetryState(policy=_retry_policy)
+        state = _retry_states[error_context]
+        response = build_retry_response(state, error_context)
+        # If we've exhausted retries, clean up the state
+        if response.get("errorHandling") == "abort":
+            _retry_states.pop(error_context, None)
+        return response  # type: ignore[return-value]
+
+    def on_success(error_context: str = "") -> None:
+        """Call after a successful operation to reset retry state."""
+        _retry_states.pop(error_context, None)
+
+    def get_token_budget() -> TokenBudget | None:
+        """Accessor for the active token budget (if any)."""
+        return _token_budget[0]
+
+    def get_file_changes() -> dict[str, str]:
+        """Accessor for file changes tracked during this session."""
+        return dict(_file_changes)
+
+    def get_mcp_manager() -> MCPLifecycleManager | None:
+        """Accessor for the MCP lifecycle manager."""
+        return _mcp_manager
+
+    def drain_pending_skill_invocations() -> list[dict[str, Any]]:
+        """Return and clear all queued InvokeSkill invocations."""
+        drained = list(_pending_skill_invocations)
+        _pending_skill_invocations.clear()
+        return drained
 
     return {
         "on_session_start": on_session_start,
@@ -510,6 +938,10 @@ def build_default_hooks(
         "on_pre_tool_use": on_pre_tool_use,
         "on_post_tool_use": on_post_tool_use,
         "on_error_occurred": on_error_occurred,
+        "get_token_budget": get_token_budget,
+        "get_file_changes": get_file_changes,
+        "get_mcp_manager": get_mcp_manager,
+        "drain_pending_skill_invocations": drain_pending_skill_invocations,
     }
 
 
@@ -594,6 +1026,7 @@ def _stringify_result(result: Any) -> str:
         return ""
     if isinstance(result, str):
         return result
+    result = _ensure_dict(result)
     try:
         return json.dumps(result, ensure_ascii=False)
     except TypeError:
@@ -601,6 +1034,7 @@ def _stringify_result(result: Any) -> str:
 
 
 def _tool_result_failed(result: Any) -> bool:
+    result = _ensure_dict(result)
     if isinstance(result, dict):
         if result.get("exitCode") not in (None, 0):
             return True
@@ -667,10 +1101,11 @@ def _write_skill_completion_memory(
 
         # Include the file path that triggered completion
         written_path = ""
-        if isinstance(tool_args, dict):
+        args_dict = _ensure_dict(tool_args)
+        if isinstance(args_dict, dict):
             for key in ("path", "filePath", "file_path", "file"):
-                if key in tool_args:
-                    written_path = str(tool_args[key])
+                if key in args_dict:
+                    written_path = str(args_dict[key])
                     break
 
         content = (
@@ -720,3 +1155,39 @@ def _build_prior_artifact_context(working_directory: Path) -> str:
         lines.append("- `column_mapping.json` — canonical column name mapping from a prior run")
 
     return "\n".join(lines)
+
+
+def _tool_cache_key(tool_name: str, tool_args: dict[str, Any]) -> str:
+    """Build a deterministic cache key from tool name and arguments."""
+    try:
+        args_str = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args_str = repr(tool_args)
+    raw = f"{tool_name}:{args_str}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _resolve_path(path_str: str, working_directory: Path) -> Path:
+    """Resolve a path relative to the working directory."""
+    candidate = Path(path_str)
+    if not candidate.is_absolute():
+        candidate = working_directory / candidate
+    return candidate.expanduser().resolve(strict=False)
+
+
+def _persist_tool_result(
+    config: CopilotCodeConfig,
+    result_text: str,
+    tool_name: str,
+    call_index: int,
+) -> Path | None:
+    """Persist a large tool result to disk and return the file path."""
+    try:
+        results_dir = config.working_path / ".copilotcode" / "tool-results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{call_index:04d}-{tool_name}.txt"
+        persist_path = results_dir / filename
+        persist_path.write_text(result_text, encoding="utf-8")
+        return persist_path
+    except OSError:
+        return None

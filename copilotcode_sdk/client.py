@@ -294,12 +294,20 @@ class CopilotCodeSession:
             cacheable_prefix=prefix,
         )
 
-    async def fork_child(self, spec: SubagentSpec) -> "EnforcedChildSession":
+    async def fork_child(
+        self,
+        spec: SubagentSpec,
+        *,
+        on_event: Any | None = None,
+    ) -> "EnforcedChildSession":
         """Fork a child session that shares this session's cacheable prefix.
 
         The child gets the same static system prompt prefix (for cache hits)
         plus the spec's suffix. Returns an :class:`EnforcedChildSession` that
         enforces ``spec.max_turns`` and ``spec.timeout_seconds``.
+
+        Pass ``on_event`` to receive the child's tool calls and other events
+        (same signature as the parent's ``on_event`` callback).
         """
         from .subagent import ChildSession, EnforcedChildSession
 
@@ -308,16 +316,22 @@ class CopilotCodeSession:
         if self._subagent_context is None:
             raise RuntimeError("No subagent context — call set_cacheable_prefix first")
 
+        from copilot.types import PermissionHandler
+
         system_message = self._subagent_context.build_child_system_message(spec)
         create_kwargs: dict[str, Any] = {
             "system_message": system_message,
             # Children auto-approve all permissions — the parent session's
             # policy already governs what's allowed.
-            "on_permission_request": lambda _: True,
+            "on_permission_request": PermissionHandler.approve_all,
         }
-        # Pass tool allowlist if spec restricts tools
-        if spec.tools:
-            create_kwargs["tools"] = [{"name": t} for t in spec.tools]
+        # Wire child events to the same callback so callers get visibility
+        if on_event is not None:
+            create_kwargs["on_event"] = on_event
+        # NOTE: Tool allowlist disabled — the copilot SDK's create_session
+        # expects Tool objects (with .name attribute), not dicts. The verifier's
+        # system prompt already constrains it to read-only tools.
+        # TODO: Convert spec.tools to proper Tool objects if filtering is needed.
         child = await self._copilot_client.create_session(**create_kwargs)
         child_id = getattr(child, "session_id", None) or "child"
         self._subagent_context.register_child(child_id)
@@ -344,11 +358,11 @@ class CopilotCodeSession:
                 spec = SubagentSpec(
                     role=f"skill:{skill_name}",
                     system_prompt_suffix=user_prompt,
-                    max_turns=20,
-                    timeout_seconds=300.0,
+                    max_turns=100,
+                    timeout_seconds=3600.0,
                 )
                 child = await self.fork_child(spec)
-                result = await child.session.send_and_wait(user_prompt, timeout=300.0)
+                result = await child.session.send_and_wait(user_prompt, timeout=3600.0)
                 await child.session.destroy()
                 summary = f"Skill '{skill_name}' completed."
                 if isinstance(result, str):

@@ -82,12 +82,14 @@ class CopilotCodeConfig:
     extra_agents: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     default_agent: str | None = None
     infinite_sessions: bool | Mapping[str, Any] = True
-    shell_timeout_ms: int = 120_000
+    shell_timeout_ms: int = 600_000
     noisy_tool_char_limit: int = 8_000
+    enforce_read_before_write: bool = True
     reminder_reinjection_interval: int = 15
     extraction_tool_call_interval: int = 20
     extraction_char_threshold: int = 50_000
     extraction_min_turn_gap: int = 10
+    extraction_mode: str = "nudge"  # "nudge" or "enforce"
     path_allowlist: Sequence[str | Path] = field(default_factory=tuple)
     permission_policy: PermissionPolicy = "safe"
     approved_shell_prefixes: Sequence[str] = field(
@@ -99,10 +101,27 @@ class CopilotCodeConfig:
     include_workspace_instruction_snippets: bool = True
     enable_skill_shorthand: bool = True
     extra_prompt_sections: Sequence[str] = field(default_factory=tuple)
+    mcp_servers: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     enable_tasks_v2: bool = True
     task_root: str | Path | None = None
     task_reminder_turns: int = 10
     task_reminder_cooldown_turns: int = 10
+    enable_predictive_suggestions: bool = False
+    session_memory_auto: bool = True
+    session_memory_min_init_tokens: int = 10_000
+    session_memory_min_update_tokens: int = 5_000
+    session_memory_tool_calls_between_updates: int = 3
+    session_memory_timeout_seconds: float = 300.0
+    session_memory_promote_on_destroy: bool = True
+    max_agent_turns: int = 0  # 0 = unlimited
+    enable_coordinator_mode: bool = False
+    enable_tool_result_cache: bool = False
+    tool_result_cache_max_size: int = 100
+    fast_model: str | None = None  # model to use in "fast" mode
+    retry_base_delay_ms: int = 1_000
+    retry_max_delay_ms: int = 30_000
+    retry_max_attempts: int = 3
+    retry_jitter: bool = True
 
     def __post_init__(self) -> None:
         self.working_directory = _resolve_path(self.working_directory)

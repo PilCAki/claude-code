@@ -25,7 +25,7 @@ MAX_VERIFIER_MALFUNCTIONS = 2
 
 VERIFIER_TOOLS = ("Read", "Bash", "Glob", "Grep")
 VERIFIER_MAX_TURNS = 20
-VERIFIER_TIMEOUT = 300.0
+VERIFIER_TIMEOUT = 3600.0  # 1 hour — verifier may need to inspect large output dirs
 
 
 class VerificationExhaustedError(Exception):
@@ -369,9 +369,10 @@ async def run_verification(
     try:
         child = await fork_child(spec)
         try:
-            raw_output = await child.send_and_wait(user_prompt, timeout=VERIFIER_TIMEOUT)
-            if not isinstance(raw_output, str):
-                raw_output = str(raw_output)
+            await child.send_and_wait(user_prompt, timeout=VERIFIER_TIMEOUT)
+            raw_output = await child.get_last_response_text()
+            if not raw_output:
+                raw_output = "(verifier produced no text response)"
         finally:
             await child.destroy()
     except Exception as exc:

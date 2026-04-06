@@ -15,6 +15,27 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 
+def _normalize_payload(value: Any) -> Any:
+    """Convert SDK event/message objects to JSON-serializable Python values.
+
+    Mirrors ``_normalize_sdk_payload`` from ``client.py`` so subagent code
+    can normalize raw SDK messages without importing from the client module.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _normalize_payload(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_payload(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _normalize_payload(to_dict())
+    try:
+        return _normalize_payload(vars(value))
+    except TypeError:
+        return str(value)
+
+
 @dataclass(frozen=True, slots=True)
 class SubagentSpec:
     """Specification for spawning a child session."""
@@ -147,6 +168,37 @@ class EnforcedChildSession:
                 prompt, timeout=effective_timeout,
             )
         return await self._child.session.send_and_wait(prompt)
+
+    async def get_last_response_text(self) -> str:
+        """Extract text from the last assistant message in the session.
+
+        The copilot SDK's ``send_and_wait`` returns a ``SessionEvent``, not text.
+        Call this after ``send_and_wait`` to get the actual assistant response.
+        Uses the same normalization as ``CopilotCodeSession`` to convert SDK
+        message objects to plain dicts.
+        """
+        get_messages = getattr(self._child.session, "get_messages", None)
+        if get_messages is None:
+            return ""
+        raw_messages = await get_messages()
+        # Normalize SDK objects to plain dicts (same as _normalize_sdk_messages)
+        messages = [_normalize_payload(m) for m in raw_messages]
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or msg.get("type") or ""
+            if role == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return " ".join(
+                        block.get("text", "")
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                return str(content)
+        return ""
 
     async def destroy(self) -> None:
         destroy = getattr(self._child.session, "destroy", None)
