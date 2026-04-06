@@ -309,7 +309,12 @@ class CopilotCodeSession:
             raise RuntimeError("No subagent context — call set_cacheable_prefix first")
 
         system_message = self._subagent_context.build_child_system_message(spec)
-        create_kwargs: dict[str, Any] = {"system_message": system_message}
+        create_kwargs: dict[str, Any] = {
+            "system_message": system_message,
+            # Children auto-approve all permissions — the parent session's
+            # policy already governs what's allowed.
+            "on_permission_request": lambda _: True,
+        }
         # Pass tool allowlist if spec restricts tools
         if spec.tools:
             create_kwargs["tools"] = [{"name": t} for t in spec.tools]
