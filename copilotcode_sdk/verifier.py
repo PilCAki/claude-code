@@ -14,9 +14,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .subagent import SubagentSpec
+
 
 MAX_VERIFICATION_ATTEMPTS = 5
 MAX_VERIFIER_MALFUNCTIONS = 2
+
+VERIFIER_TOOLS = ("Read", "Bash", "Glob", "Grep")
+VERIFIER_MAX_TURNS = 20
+VERIFIER_TIMEOUT = 300.0
 
 
 class VerificationExhaustedError(Exception):
@@ -267,3 +273,92 @@ def write_failure_trace(
 
     trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
     return str(trace_path)
+
+
+async def run_verification(
+    skill_name: str,
+    skill_content: str,
+    output_dir: Path,
+    workspace: Path,
+    fork_child: Any,
+    prior_metrics: str | None,
+) -> VerificationResult:
+    """Spawn a verifier sub-agent and return the result.
+
+    This is a single verification attempt. The caller (CompleteSkill handler)
+    manages retry loops and attempt counting.
+    """
+    # 1. Snapshot output hashes before verification
+    before_hashes = snapshot_output_hashes(output_dir)
+
+    # 2. Build the verifier spec and prompt
+    spec = SubagentSpec(
+        role="skill-verifier",
+        system_prompt_suffix=VERIFIER_SYSTEM_PROMPT,
+        tools=VERIFIER_TOOLS,
+        max_turns=VERIFIER_MAX_TURNS,
+        timeout_seconds=VERIFIER_TIMEOUT,
+    )
+
+    user_prompt = build_verifier_prompt(
+        skill_content=skill_content,
+        output_dir=str(output_dir),
+        prior_metrics=prior_metrics,
+    )
+
+    # 3. Spawn and run the verifier
+    try:
+        child = await fork_child(spec)
+        try:
+            raw_output = await child.send_and_wait(user_prompt, timeout=VERIFIER_TIMEOUT)
+            if not isinstance(raw_output, str):
+                raw_output = str(raw_output)
+        finally:
+            await child.destroy()
+    except Exception as exc:
+        return VerificationResult(
+            verdict="MALFUNCTION",
+            raw_output=f"Verifier crashed: {exc}",
+        )
+
+    # 4. Check for output tampering
+    changed = compare_output_hashes(output_dir, before_hashes)
+    if changed:
+        return VerificationResult(
+            verdict="MALFUNCTION",
+            raw_output=(
+                f"Verifier tampered with output files: {', '.join(changed)}. "
+                "Verification invalidated."
+            ),
+        )
+
+    # 5. Parse verdict
+    verdict = parse_verdict(raw_output)
+    if verdict is None:
+        return VerificationResult(
+            verdict="MALFUNCTION",
+            raw_output=(
+                "Verification failed: verifier did not produce a verdict in the "
+                "required format. Expected final line: VERDICT: PASS, VERDICT: FAIL, "
+                "or VERDICT: PARTIAL (exact string, no markdown, no punctuation)."
+            ),
+        )
+
+    # 6. Check that commands were actually run
+    if not _has_command_blocks(raw_output):
+        return VerificationResult(
+            verdict="MALFUNCTION",
+            raw_output=(
+                "Verification failed: verifier did not run any commands. Every "
+                "check must include a 'Command run:' block with actual terminal "
+                "output. A check without a command is a skip, not a PASS."
+            ),
+        )
+
+    # 7. Extract failed checks and return
+    failed_checks = extract_failed_checks(raw_output) if verdict != "PASS" else []
+    return VerificationResult(
+        verdict=verdict,
+        raw_output=raw_output,
+        failed_checks=failed_checks,
+    )
