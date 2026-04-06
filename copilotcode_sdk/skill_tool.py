@@ -428,6 +428,7 @@ def build_complete_skill_tool(
     from copilot.types import Tool, ToolInvocation, ToolResult
     from .verifier import (
         MAX_VERIFICATION_ATTEMPTS,
+        MAX_VERIFIER_MALFUNCTIONS,
         VerificationExhaustedError,
         format_fail_feedback,
         run_verification,
@@ -544,10 +545,20 @@ def build_complete_skill_tool(
                     "timestamp": time.time(),
                 })
 
-                if consecutive_malfunctions >= 3:
+                if consecutive_malfunctions >= MAX_VERIFIER_MALFUNCTIONS + 1:
                     # 3rd consecutive malfunction counts as a fail attempt
                     _attempt_counts[skill_name] += 1
                     _malfunction_counts[skill_name] = 0
+                    attempt = _attempt_counts[skill_name]
+
+                    if attempt >= MAX_VERIFICATION_ATTEMPTS:
+                        trace_path = write_failure_trace(
+                            skill_name=skill_name,
+                            history=_attempt_history[skill_name],
+                            output_dir=verify_output_dir,
+                            workspace=Path(working_directory),
+                        )
+                        raise VerificationExhaustedError(skill_name, trace_path)
 
                 return ToolResult(
                     text_result_for_llm=(
