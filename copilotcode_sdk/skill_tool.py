@@ -403,12 +403,26 @@ def build_skill_tool(
         try:
             # --- Initial work ---
             _skill_logger.info("FORK %s — child starting work", skill_name)
-            raw_result = await child.send_and_wait(user_prompt, timeout=1800.0)
+            try:
+                raw_result = await child.send_and_wait(user_prompt, timeout=1800.0)
+            except Exception as child_exc:
+                _skill_logger.error(
+                    "FORK %s — child send_and_wait raised: %s", skill_name, child_exc,
+                )
+                return ToolResult(
+                    text_result_for_llm=f"Error: child agent for '{skill_name}' failed: {child_exc}",
+                    result_type="error",
+                )
             if not isinstance(raw_result, str):
                 raw_result = str(raw_result)
             _skill_logger.info(
-                "FORK %s — child finished initial work (%d chars)",
-                skill_name, len(raw_result),
+                "FORK %s — child finished (%d chars). Output dir exists: %s",
+                skill_name, len(raw_result), verify_output_dir.exists(),
+            )
+            # Log first 500 chars of child result for debugging
+            _skill_logger.info(
+                "FORK %s — child result preview: %.500s",
+                skill_name, raw_result[:500],
             )
 
             # --- Verify/fix loop ---
