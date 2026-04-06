@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from .subagent import SubagentSpec
+
+logger = logging.getLogger("copilotcode.verifier")
 
 
 MAX_VERIFICATION_ATTEMPTS = 5
@@ -275,6 +278,56 @@ def write_failure_trace(
     return str(trace_path)
 
 
+def _log_verification_attempt(
+    workspace: Path,
+    skill_name: str,
+    attempt_num: int,
+    result: VerificationResult,
+) -> Path:
+    """Write a verification attempt log to disk and log a summary to console.
+
+    Creates one file per attempt:
+      outputs/verification_logs/{skill_name}_attempt_{N}.md
+
+    Returns the path to the log file.
+    """
+    log_dir = workspace / "outputs" / "verification_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{skill_name}_attempt_{attempt_num:02d}.md"
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    header = (
+        f"# Verification: {skill_name} — Attempt {attempt_num}\n"
+        f"**Timestamp:** {ts}\n"
+        f"**Verdict:** {result.verdict}\n"
+    )
+
+    if result.failed_checks:
+        header += f"**Failed checks:** {len(result.failed_checks)}\n"
+        for fc in result.failed_checks:
+            header += f"  - {fc.get('check', '?')}\n"
+
+    header += f"\n---\n\n## Full Verifier Output\n\n"
+
+    log_path.write_text(header + result.raw_output, encoding="utf-8")
+
+    # Console logging — visible in run.py output
+    verdict_str = result.verdict
+    if result.failed_checks:
+        checks_summary = "; ".join(fc.get("check", "?") for fc in result.failed_checks)
+        logger.info(
+            "VERIFY %s attempt %d → %s | Failed: %s | Log: %s",
+            skill_name, attempt_num, verdict_str, checks_summary, log_path.name,
+        )
+    else:
+        logger.info(
+            "VERIFY %s attempt %d → %s | Log: %s",
+            skill_name, attempt_num, verdict_str, log_path.name,
+        )
+
+    return log_path
+
+
 async def run_verification(
     skill_name: str,
     skill_content: str,
@@ -282,12 +335,18 @@ async def run_verification(
     workspace: Path,
     fork_child: Any,
     prior_metrics: str | None,
+    attempt_num: int = 0,
 ) -> VerificationResult:
     """Spawn a verifier sub-agent and return the result.
 
     This is a single verification attempt. The caller (CompleteSkill handler)
     manages retry loops and attempt counting.
+
+    *attempt_num* is used for log file naming only — the caller tracks the
+    authoritative count.
     """
+    logger.info("Starting verification for '%s' (attempt %d)...", skill_name, attempt_num)
+
     # 1. Snapshot output hashes before verification
     before_hashes = snapshot_output_hashes(output_dir)
 
@@ -316,49 +375,61 @@ async def run_verification(
         finally:
             await child.destroy()
     except Exception as exc:
-        return VerificationResult(
+        result = VerificationResult(
             verdict="MALFUNCTION",
             raw_output=f"Verifier crashed: {exc}",
         )
+        _log_verification_attempt(workspace, skill_name, attempt_num, result)
+        return result
 
     # 4. Check for output tampering
     changed = compare_output_hashes(output_dir, before_hashes)
     if changed:
-        return VerificationResult(
+        result = VerificationResult(
             verdict="MALFUNCTION",
             raw_output=(
                 f"Verifier tampered with output files: {', '.join(changed)}. "
                 "Verification invalidated."
             ),
         )
+        _log_verification_attempt(workspace, skill_name, attempt_num, result)
+        return result
 
     # 5. Parse verdict
     verdict = parse_verdict(raw_output)
     if verdict is None:
-        return VerificationResult(
+        result = VerificationResult(
             verdict="MALFUNCTION",
             raw_output=(
                 "Verification failed: verifier did not produce a verdict in the "
                 "required format. Expected final line: VERDICT: PASS, VERDICT: FAIL, "
-                "or VERDICT: PARTIAL (exact string, no markdown, no punctuation)."
+                "or VERDICT: PARTIAL (exact string, no markdown, no punctuation).\n\n"
+                "--- RAW VERIFIER OUTPUT ---\n" + raw_output
             ),
         )
+        _log_verification_attempt(workspace, skill_name, attempt_num, result)
+        return result
 
     # 6. Check that commands were actually run
     if not _has_command_blocks(raw_output):
-        return VerificationResult(
+        result = VerificationResult(
             verdict="MALFUNCTION",
             raw_output=(
                 "Verification failed: verifier did not run any commands. Every "
                 "check must include a 'Command run:' block with actual terminal "
-                "output. A check without a command is a skip, not a PASS."
+                "output. A check without a command is a skip, not a PASS.\n\n"
+                "--- RAW VERIFIER OUTPUT ---\n" + raw_output
             ),
         )
+        _log_verification_attempt(workspace, skill_name, attempt_num, result)
+        return result
 
     # 7. Extract failed checks and return
     failed_checks = extract_failed_checks(raw_output) if verdict != "PASS" else []
-    return VerificationResult(
+    result = VerificationResult(
         verdict=verdict,
         raw_output=raw_output,
         failed_checks=failed_checks,
     )
+    _log_verification_attempt(workspace, skill_name, attempt_num, result)
+    return result

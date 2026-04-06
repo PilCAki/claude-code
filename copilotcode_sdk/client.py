@@ -1084,6 +1084,7 @@ class CopilotCodeClient:
                 memory_store=self._memory_store,
                 working_directory=str(self.config.working_path),
                 completed_skills=completed_skills,
+                session_holder=session_holder,
             ))
             tools_list.append(build_complete_skill_tool(
                 skill_map=skill_map,

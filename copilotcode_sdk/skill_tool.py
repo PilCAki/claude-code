@@ -225,15 +225,17 @@ def build_skill_tool(
     memory_store: MemoryStore,
     working_directory: str,
     completed_skills: set[str],
+    session_holder: list[Any] | None = None,
 ) -> Any:
     """Build the InvokeSkill tool for the Copilot SDK.
 
     Returns a ``copilot.types.Tool`` that, when called by the agent, forks
     a child session with the full skill content and returns the result.
 
-    The tool handler is synchronous (the SDK handles the async wrapper).
-    For forked execution, we store the skill invocation details and the
-    actual forking happens in the post-tool-use hook.
+    When *session_holder* is provided and populated, the tool handler forks
+    a child session inline and waits for it to complete. The child gets the
+    full SKILL.md as its prompt and runs autonomously with all tools.
+    Without a session, falls back to returning metadata (no fork).
     """
     from copilot.types import Tool, ToolInvocation, ToolResult
 
@@ -328,28 +330,85 @@ def build_skill_tool(
             completed_skills=sorted(completed_skills),
         )
 
-        # Store the invocation details for the async fork handler
-        # The hook system will pick this up and actually fork the child
-        invocation_record = {
-            "skill_name": skill_name,
-            "user_prompt": user_prompt,
-            "skill_type": fm.get("type", ""),
-            "outputs": fm.get("outputs", ""),
-            "timestamp": time.time(),
-        }
+        # --- Fork a child session to execute the skill ---
+        session = None
+        if session_holder and len(session_holder) > 0:
+            session = session_holder[0]
 
-        # Mark as in-progress (will be completed by the hook)
-        return ToolResult(
-            text_result_for_llm=json.dumps({
-                "status": "invoke_skill",
-                "skill_name": skill_name,
-                "skill_type": fm.get("type", ""),
-                "requires": requires or "none",
-                "outputs": fm.get("outputs", ""),
-                "description": fm.get("description", ""),
-                "_invocation": invocation_record,
-            }),
-        )
+        if session is not None:
+            import logging as _log
+            _invoke_logger = _log.getLogger("copilotcode.verifier")
+            _invoke_logger.info(
+                "FORK %s — spawning child agent to execute skill", skill_name,
+            )
+            start_time = time.time()
+            try:
+                from .subagent import SubagentSpec
+                spec = SubagentSpec(
+                    role=f"skill:{skill_name}",
+                    system_prompt_suffix="",  # child gets SKILL.md via user prompt
+                    max_turns=50,
+                    timeout_seconds=1800.0,  # 30 minutes per skill
+                )
+                child = _run_async(session.fork_child(spec))
+                try:
+                    raw_result = _run_async(
+                        child.send_and_wait(user_prompt, timeout=1800.0)
+                    )
+                    if not isinstance(raw_result, str):
+                        raw_result = str(raw_result)
+                finally:
+                    _run_async(child.destroy())
+
+                elapsed = round(time.time() - start_time, 1)
+                _invoke_logger.info(
+                    "FORK %s — child completed in %.1fs (%d chars output)",
+                    skill_name, elapsed, len(raw_result),
+                )
+
+                # Return the child's result to the orchestrator
+                return ToolResult(
+                    text_result_for_llm=json.dumps({
+                        "status": "skill_complete",
+                        "skill_name": skill_name,
+                        "skill_type": fm.get("type", ""),
+                        "outputs": fm.get("outputs", ""),
+                        "elapsed_seconds": elapsed,
+                        "result_summary": raw_result[:2000],
+                    }),
+                )
+            except Exception as exc:
+                elapsed = round(time.time() - start_time, 1)
+                _invoke_logger.error(
+                    "FORK %s — child failed after %.1fs: %s",
+                    skill_name, elapsed, exc,
+                )
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Error: skill '{skill_name}' child agent failed after "
+                        f"{elapsed}s: {exc}. Review the error and try again."
+                    ),
+                    result_type="error",
+                )
+        else:
+            # No session available — return metadata (fallback, should not
+            # happen in normal operation)
+            import logging as _log
+            _log.getLogger("copilotcode.verifier").warning(
+                "NO SESSION for InvokeSkill(%s) — returning metadata only, "
+                "no child agent will be forked!", skill_name,
+            )
+            return ToolResult(
+                text_result_for_llm=json.dumps({
+                    "status": "invoke_skill_no_session",
+                    "skill_name": skill_name,
+                    "skill_type": fm.get("type", ""),
+                    "requires": requires or "none",
+                    "outputs": fm.get("outputs", ""),
+                    "description": fm.get("description", ""),
+                    "warning": "No session available — skill was NOT executed by a child agent.",
+                }),
+            )
 
     prompt = build_skill_tool_prompt(skill_map)
 
@@ -435,6 +494,9 @@ def build_complete_skill_tool(
         write_failure_trace,
     )
 
+    import logging as _logging
+    _skill_logger = _logging.getLogger("copilotcode.verifier")
+
     # Per-skill tracking (closure state, persists across calls)
     _attempt_counts: dict[str, int] = {}
     _malfunction_counts: dict[str, int] = {}
@@ -466,6 +528,10 @@ def build_complete_skill_tool(
         if outputs_rel:
             output_dir = Path(working_directory) / outputs_rel
             if not output_dir.exists():
+                _skill_logger.warning(
+                    "GATE REJECT %s: output dir '%s' does not exist",
+                    skill_name, outputs_rel,
+                )
                 return ToolResult(
                     text_result_for_llm=(
                         f"Error: output directory '{outputs_rel}' does not exist. "
@@ -478,6 +544,10 @@ def build_complete_skill_tool(
                 f.stat().st_size for f in output_dir.rglob("*") if f.is_file()
             )
             if total_bytes < MIN_OUTPUT_BYTES:
+                _skill_logger.warning(
+                    "GATE REJECT %s: output dir '%s' has only %d bytes (min %d)",
+                    skill_name, outputs_rel, total_bytes, MIN_OUTPUT_BYTES,
+                )
                 return ToolResult(
                     text_result_for_llm=(
                         f"Error: output directory '{outputs_rel}' has only "
@@ -513,7 +583,14 @@ def build_complete_skill_tool(
             else:
                 verify_output_dir = Path(working_directory)
 
-            # Run verification
+            # Initialize tracking for this skill if needed
+            if skill_name not in _attempt_counts:
+                _attempt_counts[skill_name] = 0
+                _malfunction_counts[skill_name] = 0
+                _attempt_history[skill_name] = []
+
+            # Run verification (pass current attempt number for log naming)
+            current_attempt = _attempt_counts[skill_name] + 1
             vresult = _run_async(
                 run_verification(
                     skill_name=skill_name,
@@ -522,17 +599,15 @@ def build_complete_skill_tool(
                     workspace=Path(working_directory),
                     fork_child=session.fork_child,
                     prior_metrics=prior_metrics,
+                    attempt_num=current_attempt,
                 )
             )
 
-            # Initialize tracking for this skill if needed
-            if skill_name not in _attempt_counts:
-                _attempt_counts[skill_name] = 0
-                _malfunction_counts[skill_name] = 0
-                _attempt_history[skill_name] = []
-
             if vresult.passed:
                 # PASS — reset counters and fall through to mark complete
+                _skill_logger.info(
+                    "PASS %s — verification passed, marking complete", skill_name,
+                )
                 _malfunction_counts[skill_name] = 0
             elif vresult.is_malfunction:
                 _malfunction_counts[skill_name] += 1
