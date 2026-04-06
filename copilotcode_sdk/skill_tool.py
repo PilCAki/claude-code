@@ -238,6 +238,8 @@ def build_skill_tool(
     Without a session, falls back to returning metadata (no fork).
     """
     from copilot.types import Tool, ToolInvocation, ToolResult
+    import logging as _logging
+    _skill_logger = _logging.getLogger("copilotcode.verifier")
 
     def _handle_invoke_skill(invocation: ToolInvocation) -> ToolResult:
         args = invocation.arguments or {}
@@ -336,14 +338,15 @@ def build_skill_tool(
             session = session_holder[0]
 
         if session is not None:
-            import logging as _log
-            _invoke_logger = _log.getLogger("copilotcode.verifier")
-            _invoke_logger.info(
+            _skill_logger.info(
                 "FORK %s — spawning child agent to execute skill", skill_name,
             )
             start_time = time.time()
             try:
                 from .subagent import SubagentSpec
+                # Child gets all tools EXCEPT InvokeSkill — prevents deep
+                # chaining.  CompleteSkill is included so the child can
+                # trigger verification and handle retry loops itself.
                 spec = SubagentSpec(
                     role=f"skill:{skill_name}",
                     system_prompt_suffix="",  # child gets SKILL.md via user prompt
@@ -361,7 +364,7 @@ def build_skill_tool(
                     _run_async(child.destroy())
 
                 elapsed = round(time.time() - start_time, 1)
-                _invoke_logger.info(
+                _skill_logger.info(
                     "FORK %s — child completed in %.1fs (%d chars output)",
                     skill_name, elapsed, len(raw_result),
                 )
@@ -378,8 +381,12 @@ def build_skill_tool(
                     }),
                 )
             except Exception as exc:
+                # Let VerificationExhaustedError bubble up to kill the session
+                from .verifier import VerificationExhaustedError as _VEE
+                if isinstance(exc, _VEE):
+                    raise
                 elapsed = round(time.time() - start_time, 1)
-                _invoke_logger.error(
+                _skill_logger.error(
                     "FORK %s — child failed after %.1fs: %s",
                     skill_name, elapsed, exc,
                 )
@@ -393,8 +400,7 @@ def build_skill_tool(
         else:
             # No session available — return metadata (fallback, should not
             # happen in normal operation)
-            import logging as _log
-            _log.getLogger("copilotcode.verifier").warning(
+            _skill_logger.warning(
                 "NO SESSION for InvokeSkill(%s) — returning metadata only, "
                 "no child agent will be forked!", skill_name,
             )
