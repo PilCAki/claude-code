@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
+import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,6 +29,49 @@ from copilotcode_sdk.verifier import (
     VERIFIER_SYSTEM_PROMPT,
 )
 from copilotcode_sdk.verifier import write_failure_trace
+
+
+# ---------------------------------------------------------------------------
+# Fake copilot.types fixture (mirrors test_skill_tool.py)
+# ---------------------------------------------------------------------------
+
+class FakeToolResult:
+    def __init__(self, text_result_for_llm="", result_type="success", **kw):
+        self.text_result_for_llm = text_result_for_llm
+        self.result_type = result_type
+
+
+class FakeTool:
+    def __init__(self, name="", description="", handler=None, parameters=None,
+                 overrides_built_in_tool=False, skip_permission=False):
+        self.name = name
+        self.description = description
+        self.handler = handler
+        self.parameters = parameters
+        self.skip_permission = skip_permission
+
+
+@pytest.fixture
+def fake_copilot_types():
+    """Patch copilot.types with fakes so we don't need the real SDK."""
+    fake_types = types.ModuleType("copilot.types")
+    fake_types.Tool = FakeTool
+    fake_types.ToolInvocation = MagicMock
+    fake_types.ToolResult = FakeToolResult
+    original = sys.modules.get("copilot.types")
+    sys.modules["copilot.types"] = fake_types
+    yield fake_types
+    if original is not None:
+        sys.modules["copilot.types"] = original
+    else:
+        sys.modules.pop("copilot.types", None)
+
+
+def _call_complete(tool, arguments: dict):
+    """Call a CompleteSkill tool handler directly."""
+    inv = MagicMock()
+    inv.arguments = arguments
+    return tool.handler(inv)
 
 
 class TestHashSnapshotting:
@@ -483,3 +529,188 @@ class TestRunVerification:
         assert captured_spec.role == "skill-verifier"
         assert captured_spec.max_turns == 20
         assert captured_spec.timeout_seconds == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Full integration tests
+# ---------------------------------------------------------------------------
+
+class TestFullRetryLoop:
+    """Simulate the full CompleteSkill → verify → retry → exhaust loop."""
+
+    def test_exhaustion_writes_trace_and_raises(self, tmp_path, fake_copilot_types):
+        """Simulate 5 consecutive FAILs and verify trace is written."""
+        from copilotcode_sdk.skill_tool import build_complete_skill_tool
+
+        skill_map = {
+            "test-skill": {
+                "name": "test-skill",
+                "type": "test",
+                "outputs": "outputs/test",
+                "requires": "none",
+                "_path": str(tmp_path / "SKILL.md"),
+            },
+        }
+        (tmp_path / "SKILL.md").write_text("---\nname: test-skill\n---\n# Test\n")
+        output_dir = tmp_path / "outputs" / "test"
+        output_dir.mkdir(parents=True)
+        (output_dir / "data.json").write_bytes(b"x" * 2000)
+
+        fail_output = (
+            "### Check: broken\n"
+            "**Command run:**\n  echo fail\n"
+            "**Output observed:**\n  fail\n"
+            "**Result: FAIL**\n\n"
+            "VERDICT: FAIL"
+        )
+
+        class FakeChild:
+            async def send_and_wait(self, prompt, *, timeout=None):
+                return fail_output
+            async def destroy(self):
+                pass
+
+        class FakeSession:
+            async def fork_child(self, spec):
+                return FakeChild()
+
+        completed = set()
+        tool = build_complete_skill_tool(
+            skill_map=skill_map,
+            completed_skills=completed,
+            working_directory=str(tmp_path),
+            session_holder=[FakeSession()],
+        )
+
+        inv = MagicMock()
+        inv.arguments = {"skill": "test-skill", "output_summary": "done"}
+
+        # Call 4 times — should get errors
+        for i in range(4):
+            result = tool.handler(inv)
+            assert "error" in result.result_type
+            assert "Verification FAILED" in result.text_result_for_llm
+
+        # 5th call should raise VerificationExhaustedError
+        with pytest.raises(VerificationExhaustedError) as exc_info:
+            tool.handler(inv)
+
+        assert exc_info.value.skill_name == "test-skill"
+        assert Path(exc_info.value.trace_path).exists()
+
+        # Verify trace content
+        trace = json.loads(Path(exc_info.value.trace_path).read_text())
+        assert trace["skill"] == "test-skill"
+        assert trace["attempts"] == 5
+        assert len(trace["history"]) == 5
+
+    def test_pass_after_retries(self, tmp_path, fake_copilot_types):
+        """Fail twice, then pass on third attempt."""
+        from copilotcode_sdk.skill_tool import build_complete_skill_tool
+
+        skill_map = {
+            "test-skill": {
+                "name": "test-skill",
+                "type": "test",
+                "outputs": "outputs/test",
+                "requires": "none",
+                "_path": str(tmp_path / "SKILL.md"),
+            },
+        }
+        (tmp_path / "SKILL.md").write_text("---\nname: test-skill\n---\n# Test\n")
+        output_dir = tmp_path / "outputs" / "test"
+        output_dir.mkdir(parents=True)
+        (output_dir / "data.json").write_bytes(b"x" * 2000)
+
+        call_count = [0]
+
+        class FakeChild:
+            async def send_and_wait(self, prompt, *, timeout=None):
+                call_count[0] += 1
+                if call_count[0] <= 2:
+                    return (
+                        "### Check: broken\n"
+                        "**Command run:**\n  echo fail\n"
+                        "**Output observed:**\n  fail\n"
+                        "**Result: FAIL**\n\n"
+                        "VERDICT: FAIL"
+                    )
+                return (
+                    "### Check: fixed\n"
+                    "**Command run:**\n  echo ok\n"
+                    "**Output observed:**\n  ok\n"
+                    "**Result: PASS**\n\n"
+                    "VERDICT: PASS"
+                )
+            async def destroy(self):
+                pass
+
+        class FakeSession:
+            async def fork_child(self, spec):
+                return FakeChild()
+
+        completed = set()
+        tool = build_complete_skill_tool(
+            skill_map=skill_map,
+            completed_skills=completed,
+            working_directory=str(tmp_path),
+            session_holder=[FakeSession()],
+        )
+
+        inv = MagicMock()
+        inv.arguments = {"skill": "test-skill", "output_summary": "done"}
+
+        # First 2 calls fail
+        for _ in range(2):
+            result = tool.handler(inv)
+            assert "error" in result.result_type
+
+        # Third call passes
+        result = tool.handler(inv)
+        assert "marked as complete" in result.text_result_for_llm
+        assert "test-skill" in completed
+
+    def test_malfunction_does_not_count_as_attempt(self, tmp_path, fake_copilot_types):
+        """Verifier malfunctions shouldn't burn implementer's attempts."""
+        from copilotcode_sdk.skill_tool import build_complete_skill_tool
+
+        skill_map = {
+            "test-skill": {
+                "name": "test-skill",
+                "type": "test",
+                "outputs": "outputs/test",
+                "requires": "none",
+                "_path": str(tmp_path / "SKILL.md"),
+            },
+        }
+        (tmp_path / "SKILL.md").write_text("---\nname: test-skill\n---\n# Test\n")
+        output_dir = tmp_path / "outputs" / "test"
+        output_dir.mkdir(parents=True)
+        (output_dir / "data.json").write_bytes(b"x" * 2000)
+
+        class FakeChild:
+            async def send_and_wait(self, prompt, *, timeout=None):
+                return "I looked at the files and they seem fine."
+            async def destroy(self):
+                pass
+
+        class FakeSession:
+            async def fork_child(self, spec):
+                return FakeChild()
+
+        completed = set()
+        tool = build_complete_skill_tool(
+            skill_map=skill_map,
+            completed_skills=completed,
+            working_directory=str(tmp_path),
+            session_holder=[FakeSession()],
+        )
+
+        inv = MagicMock()
+        inv.arguments = {"skill": "test-skill", "output_summary": "done"}
+
+        # First 2 malfunctions — should not count as attempts
+        for _ in range(2):
+            result = tool.handler(inv)
+            assert "error" in result.result_type
+            assert "MALFUNCTION" in result.text_result_for_llm
