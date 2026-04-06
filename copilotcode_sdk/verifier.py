@@ -232,3 +232,38 @@ def format_fail_feedback(
         parts.append(f"  Output: {check['observed']}")
         parts.append("")
     return "\n".join(parts)
+
+
+def write_failure_trace(
+    skill_name: str,
+    history: list[dict[str, Any]],
+    output_dir: Path,
+    workspace: Path,
+) -> str:
+    """Write a failure trace JSON file and return its path."""
+    trace_dir = workspace / "outputs" / "verification_failures"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / f"{skill_name}_failure_trace.json"
+
+    files: list[str] = []
+    total_bytes = 0
+    if output_dir.exists():
+        for f in sorted(output_dir.rglob("*")):
+            if f.is_file():
+                files.append(f.relative_to(output_dir).as_posix())
+                total_bytes += f.stat().st_size
+
+    trace = {
+        "skill": skill_name,
+        "attempts": len(history),
+        "final_verdict": "FAIL",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "history": history,
+        "output_snapshot": {
+            "files": files,
+            "total_bytes": total_bytes,
+        },
+    }
+
+    trace_path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+    return str(trace_path)

@@ -22,6 +22,7 @@ from copilotcode_sdk.verifier import (
     format_fail_feedback,
     VERIFIER_SYSTEM_PROMPT,
 )
+from copilotcode_sdk.verifier import write_failure_trace
 
 
 class TestHashSnapshotting:
@@ -265,3 +266,58 @@ class TestVerifierSystemPrompt:
 
     def test_prompt_has_rationalization_warnings(self):
         assert "reading is not verification" in VERIFIER_SYSTEM_PROMPT
+
+
+class TestWriteFailureTrace:
+    def test_writes_valid_json(self, tmp_path: Path):
+        history = [
+            {
+                "attempt": 1,
+                "failed_checks": [
+                    {"check": "row count", "command": "duckdb ...", "observed": "0"}
+                ],
+            },
+            {
+                "attempt": 2,
+                "failed_checks": [
+                    {"check": "schema", "command": "duckdb ...", "observed": "VARCHAR"}
+                ],
+            },
+        ]
+        output_dir = tmp_path / "outputs" / "intake"
+        output_dir.mkdir(parents=True)
+        (output_dir / "data.parquet").write_bytes(b"x" * 2000)
+
+        trace_path = write_failure_trace(
+            skill_name="excel-workbook-intake",
+            history=history,
+            output_dir=output_dir,
+            workspace=tmp_path,
+        )
+        assert Path(trace_path).exists()
+        data = json.loads(Path(trace_path).read_text())
+        assert data["skill"] == "excel-workbook-intake"
+        assert data["attempts"] == 2
+        assert len(data["history"]) == 2
+        assert "output_snapshot" in data
+        assert "data.parquet" in data["output_snapshot"]["files"]
+
+    def test_creates_verification_failures_dir(self, tmp_path: Path):
+        trace_path = write_failure_trace(
+            skill_name="intake",
+            history=[],
+            output_dir=tmp_path,
+            workspace=tmp_path,
+        )
+        assert "verification_failures" in trace_path
+        assert Path(trace_path).parent.exists()
+
+    def test_trace_has_timestamp(self, tmp_path: Path):
+        trace_path = write_failure_trace(
+            skill_name="intake",
+            history=[],
+            output_dir=tmp_path,
+            workspace=tmp_path,
+        )
+        data = json.loads(Path(trace_path).read_text())
+        assert "timestamp" in data
