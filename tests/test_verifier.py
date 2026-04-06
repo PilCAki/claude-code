@@ -69,9 +69,13 @@ def fake_copilot_types():
 
 def _call_complete(tool, arguments: dict):
     """Call a CompleteSkill tool handler directly."""
+    import asyncio
     inv = MagicMock()
     inv.arguments = arguments
-    return tool.handler(inv)
+    result = tool.handler(inv)
+    if asyncio.iscoroutine(result):
+        return asyncio.run(result)
+    return result
 
 
 class TestHashSnapshotting:
@@ -582,18 +586,24 @@ class TestFullRetryLoop:
             session_holder=[FakeSession()],
         )
 
+        import asyncio
+
         inv = MagicMock()
         inv.arguments = {"skill": "test-skill", "output_summary": "done"}
 
+        def _run(inv):
+            r = tool.handler(inv)
+            return asyncio.run(r) if asyncio.iscoroutine(r) else r
+
         # Call 4 times — should get errors
         for i in range(4):
-            result = tool.handler(inv)
+            result = _run(inv)
             assert "error" in result.result_type
             assert "Verification FAILED" in result.text_result_for_llm
 
         # 5th call should raise VerificationExhaustedError
         with pytest.raises(VerificationExhaustedError) as exc_info:
-            tool.handler(inv)
+            _run(inv)
 
         assert exc_info.value.skill_name == "test-skill"
         assert Path(exc_info.value.trace_path).exists()
@@ -657,21 +667,28 @@ class TestFullRetryLoop:
             session_holder=[FakeSession()],
         )
 
+        import asyncio
+
         inv = MagicMock()
         inv.arguments = {"skill": "test-skill", "output_summary": "done"}
 
+        def _run(inv):
+            r = tool.handler(inv)
+            return asyncio.run(r) if asyncio.iscoroutine(r) else r
+
         # First 2 calls fail
         for _ in range(2):
-            result = tool.handler(inv)
+            result = _run(inv)
             assert "error" in result.result_type
 
         # Third call passes
-        result = tool.handler(inv)
+        result = _run(inv)
         assert "marked as complete" in result.text_result_for_llm
         assert "test-skill" in completed
 
     def test_malfunction_does_not_count_as_attempt(self, tmp_path, fake_copilot_types):
         """Verifier malfunctions shouldn't burn implementer's attempts."""
+        import asyncio
         from copilotcode_sdk.skill_tool import build_complete_skill_tool
 
         skill_map = {
@@ -709,8 +726,12 @@ class TestFullRetryLoop:
         inv = MagicMock()
         inv.arguments = {"skill": "test-skill", "output_summary": "done"}
 
+        def _run(inv):
+            r = tool.handler(inv)
+            return asyncio.run(r) if asyncio.iscoroutine(r) else r
+
         # First 2 malfunctions — should not count as attempts
         for _ in range(2):
-            result = tool.handler(inv)
+            result = _run(inv)
             assert "error" in result.result_type
             assert "MALFUNCTION" in result.text_result_for_llm

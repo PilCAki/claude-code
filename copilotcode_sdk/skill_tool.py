@@ -241,7 +241,7 @@ def build_skill_tool(
     import logging as _logging
     _skill_logger = _logging.getLogger("copilotcode.verifier")
 
-    def _handle_invoke_skill(invocation: ToolInvocation) -> ToolResult:
+    async def _handle_invoke_skill(invocation: ToolInvocation) -> ToolResult:
         args = invocation.arguments or {}
         skill_name = (args.get("skill") or "").strip()
 
@@ -353,15 +353,15 @@ def build_skill_tool(
                     max_turns=50,
                     timeout_seconds=1800.0,  # 30 minutes per skill
                 )
-                child = _run_async(session.fork_child(spec))
+                child = await session.fork_child(spec)
                 try:
-                    raw_result = _run_async(
-                        child.send_and_wait(user_prompt, timeout=1800.0)
+                    raw_result = await child.send_and_wait(
+                        user_prompt, timeout=1800.0,
                     )
                     if not isinstance(raw_result, str):
                         raw_result = str(raw_result)
                 finally:
-                    _run_async(child.destroy())
+                    await child.destroy()
 
                 elapsed = round(time.time() - start_time, 1)
                 _skill_logger.info(
@@ -508,7 +508,7 @@ def build_complete_skill_tool(
     _malfunction_counts: dict[str, int] = {}
     _attempt_history: dict[str, list[dict[str, Any]]] = {}
 
-    def _handle_complete_skill(invocation: ToolInvocation) -> ToolResult:
+    async def _handle_complete_skill(invocation: ToolInvocation) -> ToolResult:
         args = invocation.arguments or {}
         skill_name = (args.get("skill") or "").strip()
 
@@ -597,16 +597,14 @@ def build_complete_skill_tool(
 
             # Run verification (pass current attempt number for log naming)
             current_attempt = _attempt_counts[skill_name] + 1
-            vresult = _run_async(
-                run_verification(
-                    skill_name=skill_name,
-                    skill_content=skill_content,
-                    output_dir=verify_output_dir,
-                    workspace=Path(working_directory),
-                    fork_child=session.fork_child,
-                    prior_metrics=prior_metrics,
-                    attempt_num=current_attempt,
-                )
+            vresult = await run_verification(
+                skill_name=skill_name,
+                skill_content=skill_content,
+                output_dir=verify_output_dir,
+                workspace=Path(working_directory),
+                fork_child=session.fork_child,
+                prior_metrics=prior_metrics,
+                attempt_num=current_attempt,
             )
 
             if vresult.passed:

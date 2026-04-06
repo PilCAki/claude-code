@@ -157,8 +157,12 @@ def tool(three_skill_map, memory_store, fake_copilot_types):
 
 
 def _call(tool_obj, args):
+    import asyncio
     handler = tool_obj.handler
-    return handler(_make_invocation(args))
+    result = handler(_make_invocation(args))
+    if asyncio.iscoroutine(result):
+        return asyncio.run(result)
+    return result
 
 
 # ===========================================================================
@@ -661,10 +665,13 @@ class TestEdgeCases:
         assert data["status"] in ("invoke_skill", "invoke_skill_no_session")
 
     def test_none_arguments(self, tool):
+        import asyncio
         t, _ = tool
         inv = MagicMock()
         inv.arguments = None
         result = t.handler(inv)
+        if asyncio.iscoroutine(result):
+            result = asyncio.run(result)
         assert result.result_type == "error"
 
     def test_shared_completed_set_mutates(self, three_skill_map, memory_store, fake_copilot_types):
@@ -703,9 +710,13 @@ class TestEdgeCases:
 
 def _call_complete(tool, arguments: dict):
     """Call a CompleteSkill tool handler directly."""
+    import asyncio
     inv = _make_invocation(arguments)
     inv.tool_name = "CompleteSkill"
-    return tool.handler(inv)
+    result = tool.handler(inv)
+    if asyncio.iscoroutine(result):
+        return asyncio.run(result)
+    return result
 
 
 class TestCompleteSkillTool:
