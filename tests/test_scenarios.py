@@ -840,7 +840,7 @@ class TestEnforcedChildScenario:
             SubagentSpec,
         )
 
-        async def slow_send(prompt):
+        async def slow_send(prompt, **kwargs):
             await asyncio.sleep(10.0)
             return "should never reach here"
 

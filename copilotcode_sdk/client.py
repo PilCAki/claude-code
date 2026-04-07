@@ -328,10 +328,8 @@ class CopilotCodeSession:
         # Wire child events to the same callback so callers get visibility
         if on_event is not None:
             create_kwargs["on_event"] = on_event
-        # NOTE: Tool allowlist disabled — the copilot SDK's create_session
-        # expects Tool objects (with .name attribute), not dicts. The verifier's
-        # system prompt already constrains it to read-only tools.
-        # TODO: Convert spec.tools to proper Tool objects if filtering is needed.
+        if spec.tools:
+            create_kwargs["available_tools"] = list(spec.tools)
         child = await self._copilot_client.create_session(**create_kwargs)
         child_id = getattr(child, "session_id", None) or "child"
         self._subagent_context.register_child(child_id)

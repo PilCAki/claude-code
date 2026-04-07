@@ -163,11 +163,10 @@ class EnforcedChildSession:
         effective_timeout = timeout or (
             self.spec.timeout_seconds if self.spec.timeout_seconds > 0 else None
         )
+        coro = self._child.session.send_and_wait(prompt)
         if effective_timeout:
-            return await self._child.session.send_and_wait(
-                prompt, timeout=effective_timeout,
-            )
-        return await self._child.session.send_and_wait(prompt)
+            return await asyncio.wait_for(coro, timeout=effective_timeout)
+        return await coro
 
     async def get_last_response_text(self) -> str:
         """Extract text from the last assistant message in the session.
@@ -181,23 +180,31 @@ class EnforcedChildSession:
         if get_messages is None:
             return ""
         raw_messages = await get_messages()
-        # Normalize SDK objects to plain dicts (same as _normalize_sdk_messages)
         messages = [_normalize_payload(m) for m in raw_messages]
         for msg in reversed(messages):
             if not isinstance(msg, dict):
                 continue
-            role = msg.get("role") or msg.get("type") or ""
-            if role == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    return content
-                if isinstance(content, list):
-                    return " ".join(
-                        block.get("text", "")
-                        for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    )
-                return str(content)
+            role = str(msg.get("role") or msg.get("type") or "")
+            if "assistant" not in role:
+                continue
+            # Direct content (CopilotCodeSession format)
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                text = " ".join(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+                if text.strip():
+                    return text
+            # Nested data.content (raw SDK event format)
+            data = msg.get("data")
+            if isinstance(data, dict):
+                nested = data.get("content", "")
+                if isinstance(nested, str) and nested.strip():
+                    return nested
         return ""
 
     async def destroy(self) -> None:

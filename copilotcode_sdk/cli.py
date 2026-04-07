@@ -15,6 +15,7 @@ from .client import CopilotCodeClient
 from .config import CopilotCodeConfig
 from .memory import MemoryStore
 from .prompt_compiler import materialize_workspace_instructions
+from .exercise import run_exercise
 from .reports import ValidationPhaseReport, ValidationReport
 from .tasks import TaskStore
 
@@ -91,6 +92,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional directory for saved live smoke transcripts.",
     )
     smoke_parser.set_defaults(func=_run_smoke)
+
+    exercise_parser = subparsers.add_parser(
+        "exercise",
+        help="Exercise every SDK subsystem with a real LLM session and report results.",
+    )
+    _add_common_config_arguments(exercise_parser)
+    exercise_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    exercise_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Seconds to wait for the exercise session to complete.",
+    )
+    exercise_parser.add_argument(
+        "--save-report",
+        dest="save_report_path",
+        default=None,
+        help="Optional JSON file path for the exercise report.",
+    )
+    exercise_parser.add_argument(
+        "--subsystems",
+        nargs="*",
+        default=None,
+        help="Optional list of specific subsystem names to exercise.",
+    )
+    exercise_parser.set_defaults(func=_run_exercise)
 
     validate_parser = subparsers.add_parser(
         "validate",
@@ -273,6 +300,20 @@ def _run_smoke(args: argparse.Namespace) -> int:
     )
     _emit_report(report.to_dict(), report.to_text(), as_json=args.json)
     return 0 if report.success else 1
+
+
+def _run_exercise(args: argparse.Namespace) -> int:
+    client = CopilotCodeClient(_config_from_args(args))
+    report = asyncio.run(
+        run_exercise(
+            client,
+            timeout=args.timeout,
+            subsystems=args.subsystems,
+            save_report_path=args.save_report_path,
+        ),
+    )
+    _emit_report(report.to_dict(), report.to_text(), as_json=args.json)
+    return 0 if report.ok else 1
 
 
 def _run_validate(args: argparse.Namespace) -> int:

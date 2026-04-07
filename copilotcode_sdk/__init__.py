@@ -19,6 +19,7 @@ from .prompt_compiler import (
     render_claude_md_template,
     render_copilot_instructions_template,
 )
+from .exercise import ExerciseReport, SubsystemResult, SUBSYSTEM_CHECKLIST, build_exercise_prompt, parse_exercise_report, run_exercise
 from .extraction import ExtractionMode, SESSION_MEMORY_SECTIONS, build_enforce_extraction_prompt, build_extraction_prompt, build_session_end_extraction_prompt, build_session_memory_update_prompt, should_extract
 from .session_memory import SessionMemoryController, SessionMemoryState
 from .session_state import SessionState, SessionStatus, RequiresActionDetails
@@ -63,6 +64,12 @@ __all__ = [
     "DEFAULT_AGENT_NAMES",
     "DEFAULT_BRAND",
     "DEFAULT_SKILL_NAMES",
+    "ExerciseReport",
+    "SubsystemResult",
+    "SUBSYSTEM_CHECKLIST",
+    "build_exercise_prompt",
+    "parse_exercise_report",
+    "run_exercise",
     "InstructionBundle",
     "MemoryStore",
     "PermissionPolicy",

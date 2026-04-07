@@ -882,13 +882,12 @@ def test_fork_child_passes_tool_allowlist(tmp_path: Path) -> None:
     spec = SubagentSpec(role="r", system_prompt_suffix="s", tools=("read", "write"))
     asyncio.run(session.fork_child(spec))
 
-    # Check that create_session was called with tools kwarg
+    # Check that create_session was called with available_tools
     assert len(fake_client.create_calls) == 1
     call_kwargs = fake_client.create_calls[0]
-    assert "tools" in call_kwargs
-    tool_names = [t["name"] for t in call_kwargs["tools"]]
-    assert "read" in tool_names
-    assert "write" in tool_names
+    assert "available_tools" in call_kwargs
+    assert "read" in call_kwargs["available_tools"]
+    assert "write" in call_kwargs["available_tools"]
 
 
 def test_fork_child_no_tools_when_spec_empty(tmp_path: Path) -> None:
