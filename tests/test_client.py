@@ -1468,3 +1468,314 @@ def test_accumulate_usage_includes_source(tmp_path: Path) -> None:
     assert d["source"] == "exercise"
     assert d["input_tokens"] == 400
     assert d["output_tokens"] == 150
+
+
+# ── SDK event visibility: compaction & context window ─────────────────
+
+
+def test_sdk_compaction_start_event(tmp_path: Path) -> None:
+    """session.compaction_start events should emit compaction_started on the bus."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        pre_compaction_tokens = 50000
+        system_tokens = 5000
+        tool_definitions_tokens = 3000
+        pre_compaction_messages_length = 42
+
+    class FakeEvent:
+        type = "session.compaction_start"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    compaction_events = [e for e in events if e.type == EventType.compaction_started]
+    assert len(compaction_events) == 1
+    d = compaction_events[0].data
+    assert d["pre_compaction_tokens"] == 50000
+    assert d["system_tokens"] == 5000
+    assert d["tool_tokens"] == 3000
+    assert d["message_count"] == 42
+
+
+def test_sdk_compaction_complete_event(tmp_path: Path) -> None:
+    """session.compaction_complete events should emit compaction_completed on the bus."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeTokensUsed:
+        input = 1000
+        output = 500
+        cached_input = 200
+
+    class FakeData:
+        pre_compaction_tokens = 50000
+        post_compaction_tokens = 20000
+        tokens_removed = 30000
+        messages_removed = 15
+        success = True
+        summary_content = "Session compacted successfully."
+        compaction_tokens_used = FakeTokensUsed()
+
+    class FakeEvent:
+        type = "session.compaction_complete"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    compaction_events = [e for e in events if e.type == EventType.compaction_completed]
+    assert len(compaction_events) == 1
+    d = compaction_events[0].data
+    assert d["pre_compaction_tokens"] == 50000
+    assert d["post_compaction_tokens"] == 20000
+    assert d["tokens_removed"] == 30000
+    assert d["messages_removed"] == 15
+    assert d["success"] is True
+    assert d["summary"] == "Session compacted successfully."
+    assert d["compaction_tokens_used"]["input"] == 1000
+    assert d["compaction_tokens_used"]["output"] == 500
+    assert d["compaction_tokens_used"]["cached_input"] == 200
+
+
+def test_sdk_context_window_event(tmp_path: Path) -> None:
+    """session.info events with context_window info_type should emit context_window_updated."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        info_type = "context_window"
+        current_tokens = 80000
+        token_limit = 200000
+
+    class FakeEvent:
+        type = "session.info"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    ctx_events = [e for e in events if e.type == EventType.context_window_updated]
+    assert len(ctx_events) == 1
+    d = ctx_events[0].data
+    assert d["current_tokens"] == 80000
+    assert d["token_limit"] == 200000
+    assert abs(d["utilization_ratio"] - 0.4) < 0.01
+
+
+def test_sdk_session_info_non_context_ignored(tmp_path: Path) -> None:
+    """session.info events with non-context info_type should not emit context events."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        info_type = "notification"
+        current_tokens = 0
+        token_limit = 0
+
+    class FakeEvent:
+        type = "session.info"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    ctx_events = [e for e in events if e.type == EventType.context_window_updated]
+    assert len(ctx_events) == 0
+
+
+def test_sdk_usage_event_still_works_after_refactor(tmp_path: Path) -> None:
+    """assistant.usage events should continue to work after the _on_sdk_event refactor."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 50
+        cache_write_tokens = 10
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    assert session._state.total_input_tokens == 500
+    assert session._state.total_output_tokens == 200
+
+
+# ── Child hook reliability ──────────────────────────────────────────────
+
+
+def _fork_child_and_get_hooks(tmp_path: Path) -> tuple[dict, "CopilotCodeSession"]:
+    """Helper: fork a child and return (hooks_dict, parent_session)."""
+    from copilotcode_sdk.client import CopilotCodeSession
+    from copilotcode_sdk.subagent import SubagentSpec
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    fake_client = FakeCopilotClient()
+    session = CopilotCodeSession(fake, store, copilot_client=fake_client)
+    session.set_cacheable_prefix("prefix")
+
+    spec = SubagentSpec(role="worker", system_prompt_suffix="do stuff")
+    asyncio.run(session.fork_child(spec))
+
+    call_kwargs = fake_client.create_calls[0]
+    return call_kwargs["hooks"], session
+
+
+def test_child_pre_tool_hook_detects_repeated_identical_calls(tmp_path: Path) -> None:
+    """Pre-tool hook returns additionalContext after 4 identical calls."""
+    hooks, _session = _fork_child_and_get_hooks(tmp_path)
+    pre_hook = hooks["on_pre_tool_use"]
+
+    input_data = {"toolName": "Write", "toolArgs": {"path": "/tmp/x", "content": "hi"}}
+    env: dict = {}
+
+    # First 3 calls should return None
+    for _ in range(3):
+        result = pre_hook(input_data, env)
+        assert result is None
+
+    # 4th identical call triggers the warning
+    result = pre_hook(input_data, env)
+    assert result is not None
+    assert "REPEATED CALL DETECTED" in result["additionalContext"]
+    assert "Write" in result["additionalContext"]
+
+    # Counter resets — next call should be None again
+    result = pre_hook(input_data, env)
+    assert result is None
+
+
+def test_child_pre_tool_hook_different_args_no_trigger(tmp_path: Path) -> None:
+    """Pre-tool hook does NOT trigger when args differ each time."""
+    hooks, _session = _fork_child_and_get_hooks(tmp_path)
+    pre_hook = hooks["on_pre_tool_use"]
+
+    for i in range(6):
+        input_data = {"toolName": "Write", "toolArgs": {"path": f"/tmp/x{i}", "content": "hi"}}
+        result = pre_hook(input_data, {})
+        assert result is None
+
+
+def test_child_pre_tool_hook_emits_tool_called_event(tmp_path: Path) -> None:
+    """Pre-tool hook emits tool_called event on parent's event bus."""
+    from copilotcode_sdk.events import EventType
+
+    hooks, session = _fork_child_and_get_hooks(tmp_path)
+    pre_hook = hooks["on_pre_tool_use"]
+
+    events_received: list = []
+    session.event_bus.subscribe(lambda e: events_received.append(e))
+
+    pre_hook({"toolName": "Bash", "toolArgs": {"command": "ls"}}, {})
+
+    tool_events = [e for e in events_received if e.type == EventType.tool_called]
+    assert len(tool_events) == 1
+    assert tool_events[0].data["tool_name"] == "Bash"
+
+
+def test_child_post_tool_hook_detects_repeated_errors(tmp_path: Path) -> None:
+    """Post-tool hook returns additionalContext after 3 identical errors."""
+    hooks, _session = _fork_child_and_get_hooks(tmp_path)
+    post_hook = hooks["on_post_tool_use"]
+
+    input_data = {
+        "toolName": "Write",
+        "toolResult": {"error": "permission denied"},
+    }
+
+    # First 2 failures return None
+    for _ in range(2):
+        result = post_hook(input_data, {})
+        assert result is None
+
+    # 3rd failure triggers the stuck loop warning
+    result = post_hook(input_data, {})
+    assert result is not None
+    assert "STUCK LOOP DETECTED" in result["additionalContext"]
+    assert "Write" in result["additionalContext"]
+
+
+def test_child_post_tool_hook_clears_on_success(tmp_path: Path) -> None:
+    """Post-tool hook clears failure count on success."""
+    hooks, _session = _fork_child_and_get_hooks(tmp_path)
+    post_hook = hooks["on_post_tool_use"]
+
+    fail_data = {"toolName": "Write", "toolResult": {"error": "bad"}}
+    ok_data = {"toolName": "Write", "toolResult": {"content": "ok"}}
+
+    # 2 failures
+    post_hook(fail_data, {})
+    post_hook(fail_data, {})
+    # Then a success — should clear the counter
+    post_hook(ok_data, {})
+    # 2 more failures should NOT trigger (counter was reset)
+    assert post_hook(fail_data, {}) is None
+    assert post_hook(fail_data, {}) is None
+
+
+def test_child_event_fallback_logs_stuck_loop(tmp_path: Path, caplog) -> None:
+    """Event-based fallback logs a warning after repeated tool failures."""
+    import logging
+    from copilotcode_sdk.client import CopilotCodeSession
+    from copilotcode_sdk.subagent import SubagentSpec
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    fake_client = FakeCopilotClient()
+    session = CopilotCodeSession(fake, store, copilot_client=fake_client)
+    session.set_cacheable_prefix("prefix")
+
+    spec = SubagentSpec(role="worker", system_prompt_suffix="do stuff")
+    asyncio.run(session.fork_child(spec))
+
+    # Extract the on_event proxy from create_session kwargs
+    call_kwargs = fake_client.create_calls[0]
+    event_proxy = call_kwargs["on_event"]
+
+    # Simulate tool.execution_complete events with errors
+    fail_event = {
+        "type": "tool.execution_complete",
+        "data": {"tool_name": "Write", "error": "permission denied"},
+    }
+
+    with caplog.at_level(logging.WARNING, logger="copilotcode.child_hook"):
+        for _ in range(3):
+            event_proxy(fail_event)
+
+    assert any("stuck-loop detected via events" in r.message.lower() for r in caplog.records)
