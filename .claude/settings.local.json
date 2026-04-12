@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "Bash(python -m pytest tests/ -v --tb=short -m \"not live and not packaging\" -x)",
+      "Bash(python -c \"from copilotcode_sdk.instructions import _split_frontmatter; print\\('OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -m pytest tests/test_hooks.py tests/test_client.py -v --tb=short -m \"not live and not packaging\" -x)",
+      "Bash(python -m pytest tests/test_compaction.py -x -q)",
+      "Bash(python -m pytest tests/test_scenarios.py::TestCompactionTranscript -x -q)",
+      "Bash(python -m pytest tests/test_hooks.py::test_invokeskill_detected_in_post_hook tests/test_hooks.py::test_invokeskill_stores_pending tests/test_hooks.py::test_drain_clears_pending tests/test_hooks.py::test_ignores_non_skill_tools tests/test_hooks.py::test_handles_malformed_json tests/test_scenarios.py::TestInvokeSkillExecution -x -q)",
+      "Bash(python -m pytest tests/test_exercise.py -x -q)",
+      "Bash(python -m pytest tests/ -x -q --timeout=60)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -m pytest tests/test_exercise.py tests/test_config.py tests/test_hooks.py tests/test_client.py tests/test_cli.py -x -q)"
     ]
   }
 }

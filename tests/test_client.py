@@ -14,6 +14,7 @@ from copilotcode_sdk.client import (
     _nearest_existing_parent,
     _write_transcript_artifact,
 )
+from copilotcode_sdk.events import turn_completed as _turn_completed_event
 from copilotcode_sdk.reports import CheckResult, PreflightReport, SmokeTestReport
 
 
@@ -55,6 +56,10 @@ class FakeSession:
     async def destroy(self) -> None:
         self.destroyed = True
 
+    def on(self, callback):
+        """Stub for SDK session event subscription."""
+        return lambda: None  # unsubscribe noop
+
 
 class FakeCopilotClient:
     def __init__(self) -> None:
@@ -86,6 +91,7 @@ class ExplodingSession(FakeSession):
 def test_create_session_wires_prompt_agents_skills_and_hooks(tmp_path: Path) -> None:
     fake_client = FakeCopilotClient()
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enabled_skills=("verify", "remember"),
@@ -112,6 +118,7 @@ def test_create_session_wires_prompt_agents_skills_and_hooks(tmp_path: Path) -> 
 def test_resume_session_uses_same_wiring(tmp_path: Path) -> None:
     fake_client = FakeCopilotClient()
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
     )
@@ -127,6 +134,7 @@ def test_resume_session_uses_same_wiring(tmp_path: Path) -> None:
 def test_session_memory_helpers_round_trip(tmp_path: Path) -> None:
     fake_client = FakeCopilotClient()
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
     )
@@ -152,7 +160,7 @@ def test_resolved_cli_path_prefers_explicit_path_over_shell_lookup(
 ) -> None:
     explicit_cli = tmp_path / "copilot-custom.exe"
     explicit_cli.write_text("", encoding="utf-8")
-    client = CopilotCodeClient(CopilotCodeConfig(working_directory=tmp_path, cli_path=str(explicit_cli)))
+    client = CopilotCodeClient(CopilotCodeConfig(model="claude-sonnet-4.6", working_directory=tmp_path, cli_path=str(explicit_cli)))
 
     monkeypatch.setattr("copilotcode_sdk.client.shutil.which", lambda value: None)
 
@@ -260,6 +268,7 @@ def test_session_kwargs_passes_skill_directories_to_system_message(tmp_path: Pat
     )
 
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enabled_skills=(),
@@ -288,6 +297,7 @@ def test_passive_skill_detection_disabled(tmp_path: Path) -> None:
     )
 
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enabled_skills=(),
@@ -318,6 +328,7 @@ def test_passive_skill_detection_disabled(tmp_path: Path) -> None:
 def test_assembler_stored_on_client(tmp_path: Path) -> None:
     """Client should store the assembler after _session_kwargs() is called."""
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
     )
@@ -341,6 +352,7 @@ def test_cacheable_only_is_shorter_than_full_render(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enabled_skills=(),
@@ -360,6 +372,7 @@ def test_cacheable_only_is_shorter_than_full_render(tmp_path: Path) -> None:
 def test_system_message_uses_cacheable_only(tmp_path: Path) -> None:
     """The system_message in session kwargs should match render(cacheable_only=True)."""
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
     )
@@ -376,6 +389,7 @@ def test_assembler_passed_to_hooks(tmp_path: Path) -> None:
     from copilotcode_sdk.prompt_compiler import PromptAssembler
 
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
     )
@@ -391,6 +405,7 @@ def test_assembler_passed_to_hooks(tmp_path: Path) -> None:
 def test_mcp_servers_in_session_start_context(tmp_path: Path) -> None:
     """MCP server configuration should flow through to session start context."""
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         mcp_servers=[
@@ -560,7 +575,7 @@ def test_session_state_accumulates_usage(tmp_path: Path) -> None:
 
     store = MemoryStore(tmp_path, tmp_path / ".mem")
     fake = FakeSessionWithUsage()
-    session = CopilotCodeSession(fake, store, model="claude-sonnet-4-6")
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
 
     asyncio.run(session.send_and_wait("hello"))
 
@@ -579,7 +594,7 @@ def test_session_cost_accumulates(tmp_path: Path) -> None:
 
     store = MemoryStore(tmp_path, tmp_path / ".mem")
     fake = FakeSessionWithUsage()
-    session = CopilotCodeSession(fake, store, model="claude-sonnet-4-6")
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
 
     assert session.cumulative_cost.total == 0.0
 
@@ -630,16 +645,16 @@ def test_model_switching(tmp_path: Path) -> None:
 
     store = MemoryStore(tmp_path, tmp_path / ".mem")
     fake = FakeSession()
-    session = CopilotCodeSession(fake, store, model="claude-opus-4-6")
+    session = CopilotCodeSession(fake, store, model="claude-opus-4.6")
 
-    assert session.active_model == "claude-opus-4-6"
+    assert session.active_model == "claude-opus-4.6"
 
-    prev = session.switch_model("claude-haiku-4-5-20251001")
+    prev = session.switch_model("claude-haiku-4.5")
     assert prev is None
-    assert session.active_model == "claude-haiku-4-5-20251001"
+    assert session.active_model == "claude-haiku-4.5"
 
     prev = session.switch_model(None)
-    assert prev == "claude-haiku-4-5-20251001"
+    assert prev == "claude-haiku-4.5"
 
 
 def test_toggle_fast_mode(tmp_path: Path) -> None:
@@ -647,15 +662,15 @@ def test_toggle_fast_mode(tmp_path: Path) -> None:
 
     store = MemoryStore(tmp_path, tmp_path / ".mem")
     fake = FakeSession()
-    session = CopilotCodeSession(fake, store, model="claude-opus-4-6")
+    session = CopilotCodeSession(fake, store, model="claude-opus-4.6")
 
     # Toggle on
-    is_fast = session.toggle_fast_mode("claude-haiku-4-5-20251001")
+    is_fast = session.toggle_fast_mode("claude-haiku-4.5")
     assert is_fast is True
-    assert session.active_model == "claude-haiku-4-5-20251001"
+    assert session.active_model == "claude-haiku-4.5"
 
     # Toggle off
-    is_fast = session.toggle_fast_mode("claude-haiku-4-5-20251001")
+    is_fast = session.toggle_fast_mode("claude-haiku-4.5")
     assert is_fast is False
 
 
@@ -787,6 +802,7 @@ def test_session_update_task_raises_without_store(tmp_path: Path) -> None:
 def test_resolve_task_store_per_session(tmp_path: Path) -> None:
     """CopilotCodeClient._resolve_task_store creates per-list stores."""
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enable_tasks_v2=True,
@@ -799,6 +815,7 @@ def test_resolve_task_store_per_session(tmp_path: Path) -> None:
 
 def test_resolve_task_store_none_when_disabled(tmp_path: Path) -> None:
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enable_tasks_v2=False,
@@ -809,6 +826,7 @@ def test_resolve_task_store_none_when_disabled(tmp_path: Path) -> None:
 
 def test_resolve_task_store_fallback_to_shared(tmp_path: Path) -> None:
     config = CopilotCodeConfig(
+        model="claude-sonnet-4.6",
         working_directory=tmp_path,
         memory_root=tmp_path / ".mem",
         enable_tasks_v2=True,
@@ -828,7 +846,7 @@ def test_resume_session_sets_cacheable_prefix(tmp_path: Path) -> None:
     from copilotcode_sdk.client import CopilotCodeSession
 
     store = MemoryStore(tmp_path, tmp_path / ".mem")
-    config = CopilotCodeConfig(working_directory=tmp_path, memory_root=tmp_path / ".mem")
+    config = CopilotCodeConfig(model="claude-sonnet-4.6", working_directory=tmp_path, memory_root=tmp_path / ".mem")
     fake_client = FakeCopilotClient()
     client = CopilotCodeClient(config, copilot_client=fake_client)
 
@@ -905,3 +923,548 @@ def test_fork_child_no_tools_when_spec_empty(tmp_path: Path) -> None:
 
     call_kwargs = fake_client.create_calls[0]
     assert "tools" not in call_kwargs
+
+
+# ── Wave 6b: Model switching events ──────────────────────────────────────
+
+
+def test_switch_model_emits_event(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    session.switch_model("claude-opus-4.6")
+
+    model_events = [e for e in events if e.type == EventType.model_switched]
+    assert len(model_events) == 1
+    assert model_events[0].data["from"] == "claude-sonnet-4.6"
+    assert model_events[0].data["to"] == "claude-opus-4.6"
+
+
+def test_switch_model_none_reverts_to_default(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    session.switch_model("claude-opus-4.6")
+    session.switch_model(None)
+
+    assert session._model_override is None
+
+
+def test_switch_model_multiple_times_emits_multiple_events(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    session.switch_model("claude-opus-4.6")
+    session.switch_model("claude-haiku-4.5")
+
+    model_events = [e for e in events if e.type == EventType.model_switched]
+    assert len(model_events) == 2
+    assert model_events[0].data["to"] == "claude-opus-4.6"
+    assert model_events[1].data["from"] == "claude-opus-4.6"
+    assert model_events[1].data["to"] == "claude-haiku-4.5"
+
+
+def test_switch_model_none_does_not_emit_event(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    session.switch_model(None)
+
+    model_events = [e for e in events if e.type == EventType.model_switched]
+    assert len(model_events) == 0
+
+
+def test_toggle_fast_mode_with_none(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    result = session.toggle_fast_mode(None)
+    assert result is False
+    assert session._model_override is None
+
+
+# ── Wave 6c: Cost event logging ──────────────────────────────────────────
+
+
+def test_cost_event_emitted_on_send(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    # Simulate SDK usage event
+    class FakeData:
+        input_tokens = 1000
+        output_tokens = 500
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    assert cost_events[0].data["model"] == "claude-sonnet-4.6"
+    assert cost_events[0].data["turn_cost"] > 0
+    assert cost_events[0].data["total_cost"] > 0
+
+
+def test_cost_event_total_grows(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 2
+    assert cost_events[1].data["total_cost"] > cost_events[0].data["total_cost"]
+
+
+def test_cost_event_not_emitted_without_model(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model=None)
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 100
+        output_tokens = 50
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = None
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 0
+
+
+def test_cost_uses_active_model_pricing(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-opus-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class OpusData:
+        input_tokens = 1000
+        output_tokens = 500
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-opus-4.6"
+
+    class OpusEvent:
+        type = "assistant.usage"
+        data = OpusData()
+
+    session._on_sdk_event(OpusEvent())
+    opus_cost = events[-1].data["turn_cost"]
+
+    session.switch_model("claude-haiku-4.5")
+
+    class HaikuData:
+        input_tokens = 1000
+        output_tokens = 500
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-haiku-4.5"
+
+    class HaikuEvent:
+        type = "assistant.usage"
+        data = HaikuData()
+
+    session._on_sdk_event(HaikuEvent())
+    haiku_cost = [e for e in events if e.type == EventType.cost_accumulated][-1].data["turn_cost"]
+
+    assert haiku_cost < opus_cost
+
+
+def test_cost_accumulation_correct_values(tmp_path: Path) -> None:
+    from copilotcode_sdk.model_cost import calculate_cost
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeData:
+        input_tokens = 1000
+        output_tokens = 500
+        cache_read_tokens = 100
+        cache_write_tokens = 50
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    expected = calculate_cost(
+        "claude-sonnet-4.6",
+        input_tokens=1000,
+        output_tokens=500,
+        cache_read_tokens=100,
+        cache_creation_tokens=50,
+    )
+    assert abs(session._cumulative_cost.total - expected.total) < 1e-10
+
+
+def test_turn_completed_event_emitted(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    # Simulate usage event to record tokens
+    class FakeData:
+        input_tokens = 1000
+        output_tokens = 500
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    # Now call _emit_turn_completed
+    session._state._turn_count = 1
+    session._event_bus.emit(_turn_completed_event(
+        turn_count=1,
+        input_tokens=1000,
+        output_tokens=500,
+    ))
+
+    turn_events = [e for e in events if e.type == EventType.turn_completed]
+    assert len(turn_events) == 1
+    assert turn_events[0].data["turn_count"] == 1
+    assert turn_events[0].data["input_tokens"] == 1000
+    assert turn_events[0].data["output_tokens"] == 500
+
+
+# ── Wave 6d: SDK event path token tracking ───────────────────────────────
+
+
+def test_sdk_usage_event_tracks_tokens(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 50
+        cache_write_tokens = 25
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    assert session._state.total_input_tokens == 500
+    assert session._state.total_output_tokens == 200
+
+
+def test_sdk_usage_event_emits_cost_event(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 50
+        cache_write_tokens = 25
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    assert cost_events[0].data["turn_cost"] > 0
+
+
+def test_sdk_usage_event_accumulates_across_calls(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 50
+        cache_write_tokens = 25
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+    session._on_sdk_event(FakeEvent())
+
+    assert session._state.total_input_tokens == 1000
+    assert session._state.total_output_tokens == 400
+    assert session._cumulative_cost.total > 0
+
+
+def test_sdk_usage_event_ignores_non_usage(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeEvent:
+        type = "other.event"
+        data = None
+
+    session._on_sdk_event(FakeEvent())
+
+    assert session._state.total_input_tokens == 0
+    assert session._state.total_output_tokens == 0
+
+
+def test_sdk_usage_event_with_enum_type(tmp_path: Path) -> None:
+    from enum import Enum
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeEventType(Enum):
+        USAGE = "assistant.usage"
+
+    class FakeData:
+        input_tokens = 300
+        output_tokens = 100
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = FakeEventType.USAGE
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    assert session._state.total_input_tokens == 300
+    assert session._state.total_output_tokens == 100
+
+
+# ── Wave 7: Cost event carries token counts and source lineage ───────────
+
+
+def test_cost_event_includes_token_counts(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 800
+        output_tokens = 300
+        cache_read_tokens = 100
+        cache_write_tokens = 50
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    d = cost_events[0].data
+    assert d["input_tokens"] == 800
+    assert d["output_tokens"] == 300
+    assert d["cache_read_tokens"] == 100
+    assert d["cache_write_tokens"] == 50
+
+
+def test_cost_event_includes_source(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6", source="verifier")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 100
+        output_tokens = 50
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert cost_events[0].data["source"] == "verifier"
+
+
+def test_cost_event_default_source_is_main(tmp_path: Path) -> None:
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 100
+        output_tokens = 50
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert cost_events[0].data["source"] == "main"
+
+
+def test_cost_logger_fires_on_event(tmp_path: Path, caplog) -> None:
+    """The auto-subscribed cost logger should write to copilotcode.cost logger."""
+    import logging
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 0
+        cache_write_tokens = 0
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    with caplog.at_level(logging.INFO, logger="copilotcode.cost"):
+        session._on_sdk_event(FakeEvent())
+
+    assert any("model=claude-sonnet-4.6" in r.message for r in caplog.records)
+    assert any("in=500" in r.message for r in caplog.records)
+    assert any("out=200" in r.message for r in caplog.records)
+
+
+def test_accumulate_usage_includes_source(tmp_path: Path) -> None:
+    """The fallback _accumulate_usage path should also include source and tokens."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6", source="exercise")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    # Simulate a send_and_wait result with usage data
+    result = {
+        "usage": {
+            "input_tokens": 400,
+            "output_tokens": 150,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+        }
+    }
+    session._accumulate_usage(result)
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    d = cost_events[0].data
+    assert d["source"] == "exercise"
+    assert d["input_tokens"] == 400
+    assert d["output_tokens"] == 150

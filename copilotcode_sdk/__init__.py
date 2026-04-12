@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .agents import build_default_custom_agents, persist_agent_output, COORDINATOR_PROTOCOL, WORKTREE_NOTICE
 from .brand import BrandSpec, DEFAULT_BRAND
-from .client import CopilotCodeClient, CopilotCodeSession
+from .client import CopilotCodeClient, CopilotCodeSession, ModelMismatchError
 from .config import CopilotCodeConfig, DEFAULT_AGENT_NAMES, DEFAULT_SKILL_NAMES
 from .memory import MemoryStore
 from .permissions import PermissionPolicy
@@ -19,7 +19,7 @@ from .prompt_compiler import (
     render_claude_md_template,
     render_copilot_instructions_template,
 )
-from .exercise import ExerciseReport, SubsystemResult, SUBSYSTEM_CHECKLIST, build_exercise_prompt, parse_exercise_report, run_exercise
+from .exercise import ExerciseReport, ExerciseMode, SubsystemResult, SUBSYSTEM_CHECKLIST, ORCHESTRATION_SCENARIOS, build_exercise_prompt, build_orchestration_prompt, parse_exercise_report, run_exercise
 from .extraction import ExtractionMode, SESSION_MEMORY_SECTIONS, build_enforce_extraction_prompt, build_extraction_prompt, build_session_end_extraction_prompt, build_session_memory_update_prompt, should_extract
 from .session_memory import SessionMemoryController, SessionMemoryState
 from .session_state import SessionState, SessionStatus, RequiresActionDetails
@@ -35,6 +35,13 @@ from .reports import CheckResult, PreflightReport, SmokeTestReport
 from .suggestions import build_prompt_suggestions, format_suggestions_prompt
 from .skill_assets import SkillTracker, build_skill_catalog, parse_skill_frontmatter
 from .skill_tool import build_skill_tool, build_skill_tool_prompt
+from .holistic_verifier import (
+    HOLISTIC_VERIFIER_SYSTEM_PROMPT,
+    build_holistic_checker,
+    build_holistic_verifier_prompt,
+    format_holistic_feedback,
+    run_holistic_verification,
+)
 from .verifier import (
     MAX_VERIFICATION_ATTEMPTS,
     MAX_VERIFIER_MALFUNCTIONS,
@@ -64,10 +71,13 @@ __all__ = [
     "DEFAULT_AGENT_NAMES",
     "DEFAULT_BRAND",
     "DEFAULT_SKILL_NAMES",
+    "ExerciseMode",
     "ExerciseReport",
     "SubsystemResult",
     "SUBSYSTEM_CHECKLIST",
+    "ORCHESTRATION_SCENARIOS",
     "build_exercise_prompt",
+    "build_orchestration_prompt",
     "parse_exercise_report",
     "run_exercise",
     "InstructionBundle",
@@ -155,6 +165,11 @@ __all__ = [
     "MAX_VERIFICATION_ATTEMPTS",
     "MAX_VERIFIER_MALFUNCTIONS",
     "VERIFIER_SYSTEM_PROMPT",
+    "HOLISTIC_VERIFIER_SYSTEM_PROMPT",
+    "build_holistic_checker",
+    "build_holistic_verifier_prompt",
+    "format_holistic_feedback",
+    "run_holistic_verification",
     "VerificationExhaustedError",
     "VerificationResult",
     "build_verifier_prompt",

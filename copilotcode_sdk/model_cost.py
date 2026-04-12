@@ -5,31 +5,46 @@ from typing import Any
 
 # Pricing per million tokens (as of 2025)
 # Format: (input_per_1M, output_per_1M, cache_read_per_1M, cache_write_per_1M)
+#
+# Claude model names use DOTS in version numbers (e.g. claude-sonnet-4.6).
+# The Copilot CLI requires this format.
 MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
     # Claude 4.x / Opus
     "claude-opus-4-20250514": (15.0, 75.0, 1.50, 18.75),
-    "claude-opus-4-6": (15.0, 75.0, 1.50, 18.75),
+    "claude-opus-4.6": (15.0, 75.0, 1.50, 18.75),
     # Claude 4.x / Sonnet
     "claude-sonnet-4-20250514": (3.0, 15.0, 0.30, 3.75),
-    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 3.75),
+    "claude-sonnet-4.6": (3.0, 15.0, 0.30, 3.75),
     # Claude 3.5/4.5
     "claude-3-5-sonnet-20241022": (3.0, 15.0, 0.30, 3.75),
     "claude-3-5-haiku-20241022": (0.80, 4.0, 0.08, 1.0),
-    "claude-haiku-4-5-20251001": (0.80, 4.0, 0.08, 1.0),
+    "claude-haiku-4.5": (0.80, 4.0, 0.08, 1.0),
     # Claude 3
     "claude-3-opus-20240229": (15.0, 75.0, 1.50, 18.75),
     "claude-3-sonnet-20240229": (3.0, 15.0, 0.30, 3.75),
     "claude-3-haiku-20240307": (0.25, 1.25, 0.03, 0.30),
+    # OpenAI models (cache_read = 50% of input, cache_write = input price)
+    "gpt-4.1": (2.0, 8.0, 0.50, 2.0),
+    "gpt-4.1-mini": (0.40, 1.60, 0.10, 0.40),
+    "gpt-4.1-nano": (0.10, 0.40, 0.025, 0.10),
+    "gpt-5-mini": (0.40, 1.60, 0.10, 0.40),  # same tier as 4.1-mini
+    "gpt-5.4": (2.50, 15.0, 0.25, 2.50),
+    "gpt-5.4-mini": (0.75, 4.50, 0.075, 0.75),
+    "gpt-5.4-nano": (0.20, 1.25, 0.02, 0.20),
+    "gpt-5.4-pro": (30.0, 180.0, 3.0, 30.0),
+    "o3": (2.0, 8.0, 0.50, 2.0),
+    "o3-mini": (1.10, 4.40, 0.275, 1.10),
+    "o4-mini": (1.10, 4.40, 0.275, 1.10),
 }
 
 # Short aliases map to full model IDs
 _ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-    "claude-opus": "claude-opus-4-6",
-    "claude-sonnet": "claude-sonnet-4-6",
-    "claude-haiku": "claude-haiku-4-5-20251001",
+    "opus": "claude-opus-4.6",
+    "sonnet": "claude-sonnet-4.6",
+    "haiku": "claude-haiku-4.5",
+    "claude-opus": "claude-opus-4.6",
+    "claude-sonnet": "claude-sonnet-4.6",
+    "claude-haiku": "claude-haiku-4.5",
 }
 
 def _resolve_model(model: str) -> str:
@@ -85,9 +100,9 @@ def calculate_cost(
 def get_knowledge_cutoff(model: str) -> str:
     """Return the knowledge cutoff date string for a model."""
     resolved = _resolve_model(model)
-    if "opus-4-6" in resolved or "opus-4-5" in resolved:
+    if "opus-4.6" in resolved or "opus-4.5" in resolved:
         return "May 2025"
-    if "sonnet-4-6" in resolved:
+    if "sonnet-4.6" in resolved:
         return "August 2025"
     if "sonnet-4" in resolved:
         return "January 2025"

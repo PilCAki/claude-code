@@ -14,12 +14,15 @@ Memory inheritance follows Claude Code's approach:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Sequence
 
 from .memory import MemoryStore
 from .skill_assets import parse_skill_frontmatter
+
+_skill_logger = logging.getLogger("copilotcode_sdk.skill_tool")
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +147,49 @@ def _read_skill_content(skill_map: dict[str, dict[str, str]], skill_name: str) -
     if siblings:
         content += (
             "\n\n---\n"
-            "**This skill directory also contains the following files. "
-            "Use read_file to access them:**\n"
-            + "\n".join(f"- `{s}`" for s in siblings)
+            "**REFERENCE FILES — use the absolute paths below (not relative "
+            "paths from the instructions above). These files live in the skill "
+            "definition directory, NOT in your workspace:**\n"
+            + "\n".join(
+                f"- `{s}` → read_file `{skill_dir / s}`"
+                for s in siblings
+            )
         )
+
+    # Prior scripts hint — point to reusable scripts from prior runs
+    content += (
+        "\n\n---\n"
+        f"**PRIOR RUN SCRIPTS (TRY THESE FIRST):** Check `scripts/{skill_name}/` for "
+        "working scripts from prior runs that produced verified results on data with the "
+        "same structure. If found:\n"
+        "1. Compare the new data's schema to what the scripts expect (column names, sheet "
+        "names, row counts, basic shape)\n"
+        "2. If the schema looks compatible, try running the scripts on the new data\n"
+        "3. Validate outputs — check row counts, spot-check values, compare aggregates to "
+        "`prior_run_metrics.json` if available\n"
+        "4. If outputs look right, proceed to self-score and CompleteSkill\n"
+        "5. If scripts fail or outputs look wrong, investigate before falling back to "
+        "working from scratch\n"
+        "These scripts saved significant time on prior runs. Reuse them when possible.\n\n"
+        f"If `scripts/{skill_name}/` is empty or missing, also check `runs/*/scripts/"
+        f"{skill_name}/` for archived scripts from prior runs that you can copy, adapt, "
+        "and reuse.\n"
+    )
+
+    # Prior learnings hint — point to the accumulated learnings/ directory
+    content += (
+        "\n\n---\n"
+        "**PRIOR RUN LEARNINGS (CRITICAL — READ FIRST):** Check the `learnings/` directory "
+        "in your workspace for accumulated learnings from prior runs. Look for files matching "
+        f"`learnings/{skill_name}_*.md` — these contain hard-won lessons about data quirks, "
+        "type coercion fixes, structural notes, and recommended approaches. "
+        "**Read ALL matching learnings files before beginning work.** They will prevent you "
+        "from repeating mistakes that prior runs already solved.\n"
+    )
+
     return content
+
+
 
 
 def _build_skill_user_prompt(
@@ -210,8 +251,14 @@ def _build_skill_user_prompt(
         "",
         "1. Follow the skill methodology above step by step.",
         "2. Write all outputs to the paths specified in the skill definition.",
-        "3. Verify your outputs match the quality rubric before finishing.",
-        "4. Do NOT call CompleteSkill or InvokeSkill — verification and completion",
+        "3. If the skill defines a quality rubric, you MUST self-score before finishing:",
+        "   a. Score every dimension 0/1/2 with a one-sentence justification.",
+        "   b. Write to self_score.json in the skill's output directory.",
+        "   c. If total < threshold or any dimension = 0, fix gaps before finishing.",
+        "   d. Do NOT inflate scores. The verifier will independently audit them.",
+        "4. Do NOT pad, fake, or manufacture compliance. Produce genuine content.",
+        "   Honest incompleteness is acceptable; manufactured compliance is not.",
+        "5. Do NOT call CompleteSkill or InvokeSkill — verification and completion",
         "   are handled automatically after you finish.",
     ])
 
@@ -224,6 +271,7 @@ def build_skill_tool(
     working_directory: str,
     completed_skills: set[str],
     session_holder: list[Any] | None = None,
+    run_tag: str | None = None,
 ) -> Any:
     """Build the InvokeSkill tool for the Copilot SDK.
 
@@ -402,23 +450,68 @@ def build_skill_tool(
             except Exception:
                 return
 
+            def _get(key, default=""):
+                if isinstance(event, dict):
+                    data = event.get("data", {})
+                    return data.get(key, default) if isinstance(data, dict) else default
+                data = getattr(event, "data", None)
+                if data is None:
+                    return default
+                if isinstance(data, dict):
+                    return data.get(key, default)
+                return getattr(data, key, default)
+
+            def _get_args():
+                if isinstance(event, dict):
+                    data = event.get("data", {})
+                    return data.get("arguments", {}) if isinstance(data, dict) else {}
+                data = getattr(event, "data", None)
+                if data is None:
+                    return {}
+                if isinstance(data, dict):
+                    return data.get("arguments", {})
+                return getattr(data, "arguments", {}) or {}
+
+            def _tool_detail(tool_name, args):
+                """Return a short detail string for the tool call."""
+                if not isinstance(args, dict):
+                    return ""
+                if tool_name in ("bash", "shell", "powershell"):
+                    cmd = args.get("command", "")
+                    return f" $ {cmd[:120]}{'...' if len(cmd) > 120 else ''}"
+                if tool_name in ("read_powershell", "stop_powershell"):
+                    return ""
+                if tool_name == "report_intent":
+                    intent = args.get("intent", args.get("description", args.get("text", "")))
+                    if not intent:
+                        # Try top-level string values
+                        for v in args.values():
+                            if isinstance(v, str) and v:
+                                intent = v
+                                break
+                    return f" >> {intent[:150]}" if intent else ""
+                if tool_name in ("write_file", "write", "edit", "create_file",
+                                 "create", "read_file", "read", "view"):
+                    path = args.get("path", args.get("filePath",
+                            args.get("file_path", args.get("file", ""))))
+                    return f" {path}" if path else ""
+                if tool_name == "glob":
+                    pattern = args.get("pattern", args.get("glob", ""))
+                    return f" {pattern}" if pattern else ""
+                if tool_name in ("InvokeSkill", "CompleteSkill"):
+                    return f" skill={args.get('skill', '?')}"
+                return ""
+
             if etype == "tool.execution_start":
-                if isinstance(event, dict):
-                    data = event.get("data", {})
-                    tool_name = data.get("tool_name", "?") if isinstance(data, dict) else "?"
-                else:
-                    data = getattr(event, "data", None)
-                    tool_name = getattr(data, "tool_name", "?") if data else "?"
-                _skill_logger.info("CHILD %s — tool: %s", skill_name, tool_name)
+                tool_name = _get("tool_name", "?")
+                args = _get_args()
+                detail = _tool_detail(tool_name, args)
+                # Track last tool name so execution_complete can reference it
+                _child_event_handler._last_tool = tool_name
+                _skill_logger.info("CHILD %s — tool: %s%s", skill_name, tool_name, detail)
             elif etype == "tool.execution_complete":
-                if isinstance(event, dict):
-                    data = event.get("data", {})
-                    tool_name = data.get("tool_name", "?") if isinstance(data, dict) else "?"
-                    error = data.get("error") if isinstance(data, dict) else None
-                else:
-                    data = getattr(event, "data", None)
-                    tool_name = getattr(data, "tool_name", "?") if data else "?"
-                    error = getattr(data, "error", None) if data else None
+                tool_name = _get("tool_name") or getattr(_child_event_handler, "_last_tool", "?")
+                error = _get("error")
                 if error:
                     _skill_logger.warning(
                         "CHILD %s — tool DONE (error): %s — %s",
@@ -452,7 +545,7 @@ def build_skill_tool(
             # --- Initial work ---
             _skill_logger.info("FORK %s — child starting work", skill_name)
             try:
-                await child.send_and_wait(user_prompt, timeout=1800.0)
+                await child.send_and_wait(user_prompt, timeout=3600.0)
                 raw_result = await child.get_last_response_text()
                 if not raw_result:
                     raw_result = "(child produced no text response)"
@@ -494,7 +587,7 @@ def build_skill_tool(
                         await child.send_and_wait(
                             f"Output directory '{outputs_rel}' does not exist. "
                             f"You must write outputs to this directory. Fix this now.",
-                            timeout=1800.0,
+                            timeout=3600.0,
                         )
                         raw_result = await child.get_last_response_text()
                         continue
@@ -517,13 +610,50 @@ def build_skill_tool(
                         await child.send_and_wait(
                             f"Output directory '{outputs_rel}' has only {total_bytes} "
                             f"bytes — this looks like placeholders. Write real outputs.",
-                            timeout=1800.0,
+                            timeout=3600.0,
                         )
                         raw_result = await child.get_last_response_text()
                         continue
 
                 # Run verification
                 current_attempt = attempt_counts + 1
+
+                def _verifier_event_handler(event) -> None:
+                    """Log verifier sub-agent events for visibility."""
+                    try:
+                        if isinstance(event, dict):
+                            raw_type = event.get("type", "")
+                        else:
+                            raw_type = getattr(event, "type", "")
+                        etype = raw_type.value if hasattr(raw_type, "value") else str(raw_type)
+                    except Exception:
+                        return
+
+                    def _vget(key, default=""):
+                        if isinstance(event, dict):
+                            data = event.get("data", {})
+                            return data.get(key, default) if isinstance(data, dict) else default
+                        data = getattr(event, "data", None)
+                        if data is None:
+                            return default
+                        if isinstance(data, dict):
+                            return data.get(key, default)
+                        return getattr(data, key, default)
+
+                    if etype == "tool.execution_start":
+                        tool_name = _vget("tool_name", "?")
+                        _skill_logger.info(
+                            "VERIFY %s — tool: %s", skill_name, tool_name,
+                        )
+                    elif etype == "tool.execution_complete":
+                        tool_name = _vget("tool_name", "?")
+                        error = _vget("error")
+                        if error:
+                            _skill_logger.warning(
+                                "VERIFY %s — tool DONE (error): %s — %s",
+                                skill_name, tool_name, str(error)[:200],
+                            )
+
                 vresult = await run_verification(
                     skill_name=skill_name,
                     skill_content=skill_content,
@@ -532,11 +662,82 @@ def build_skill_tool(
                     fork_child=session.fork_child,
                     prior_metrics=prior_metrics,
                     attempt_num=current_attempt,
+                    on_event=_verifier_event_handler,
+                    prior_attempts=attempt_history if attempt_history else None,
                 )
 
                 if vresult.passed:
                     _skill_logger.info("PASS %s — verification passed", skill_name)
                     completed_skills.add(skill_name)
+
+                    # --- Post-verification scripts-save phase ---
+                    scripts_prompt, scripts_dir = _request_save_scripts_prompt(
+                        skill_name, working_directory,
+                    )
+                    for scripts_attempt in range(1, MAX_SCRIPTS_RETRIES + 2):
+                        try:
+                            await child.send_and_wait(scripts_prompt, timeout=300.0)
+                        except Exception as scripts_exc:
+                            _skill_logger.warning(
+                                "SCRIPTS %s — send failed: %s", skill_name, scripts_exc,
+                            )
+                            break
+                        if scripts_dir.exists() and any(scripts_dir.iterdir()):
+                            _skill_logger.info(
+                                "SCRIPTS %s — saved (%d files)",
+                                skill_name, len(list(scripts_dir.iterdir())),
+                            )
+                            break
+                        if scripts_attempt <= MAX_SCRIPTS_RETRIES:
+                            _skill_logger.warning(
+                                "SCRIPTS %s — dir empty (attempt %d/%d), retrying",
+                                skill_name, scripts_attempt, MAX_SCRIPTS_RETRIES + 1,
+                            )
+                            scripts_prompt = (
+                                "The scripts directory is empty. Please save your working "
+                                f"scripts to `{SCRIPTS_DIR}/{skill_name}/`. Extract the key "
+                                "logic you used into runnable .py files."
+                            )
+                        else:
+                            _skill_logger.warning(
+                                "SCRIPTS %s — skipped after %d attempts",
+                                skill_name, MAX_SCRIPTS_RETRIES + 1,
+                            )
+
+                    # --- Post-verification learnings phase ---
+                    learn_prompt, learn_path = _request_learnings_prompt(
+                        skill_name, run_tag, working_directory,
+                    )
+                    for learn_attempt in range(1, MAX_LEARNINGS_RETRIES + 2):
+                        try:
+                            await child.send_and_wait(learn_prompt, timeout=300.0)
+                        except Exception as learn_exc:
+                            _skill_logger.warning(
+                                "LEARNINGS %s — send failed: %s", skill_name, learn_exc,
+                            )
+                            break
+                        if learn_path.exists() and learn_path.stat().st_size > 50:
+                            _skill_logger.info(
+                                "LEARNINGS %s — written (%d bytes)",
+                                skill_name, learn_path.stat().st_size,
+                            )
+                            break
+                        if learn_attempt <= MAX_LEARNINGS_RETRIES:
+                            _skill_logger.warning(
+                                "LEARNINGS %s — file not found (attempt %d/%d), retrying",
+                                skill_name, learn_attempt, MAX_LEARNINGS_RETRIES + 1,
+                            )
+                            rel = learn_path.relative_to(Path(working_directory))
+                            learn_prompt = (
+                                "The learnings file was not created. Please write your "
+                                f"learnings to `{rel}`. Create the directory if needed."
+                            )
+                        else:
+                            _skill_logger.warning(
+                                "LEARNINGS %s — skipped after %d attempts",
+                                skill_name, MAX_LEARNINGS_RETRIES + 1,
+                            )
+
                     total_elapsed = round(time.time() - total_start, 1)
                     return ToolResult(
                         text_result_for_llm=json.dumps({
@@ -555,6 +756,38 @@ def build_skill_tool(
                         "raw_output": vresult.raw_output,
                         "timestamp": time.time(),
                     })
+
+                    # If verifier tampered with outputs, send back to CHILD
+                    # to regenerate — corrupted files can't be re-verified
+                    is_tamper = vresult.is_tamper
+                    if is_tamper:
+                        _skill_logger.warning(
+                            "TAMPER %s — verifier corrupted output files, "
+                            "sending back to child to regenerate",
+                            skill_name,
+                        )
+                        attempt_counts += 1
+                        malfunction_counts = 0
+                        if attempt_counts >= MAX_VERIFICATION_ATTEMPTS:
+                            trace_path = write_failure_trace(
+                                skill_name, attempt_history, verify_output_dir,
+                                Path(working_directory),
+                            )
+                            raise VerificationExhaustedError(skill_name, trace_path)
+                        tampered_files = vresult.raw_output or ""
+                        await child.send_and_wait(
+                            "## OUTPUTS CORRUPTED BY VERIFIER\n\n"
+                            "The verification process accidentally modified some of "
+                            "your output files. These files are now corrupted and "
+                            "must be regenerated:\n\n"
+                            f"{tampered_files}\n\n"
+                            "Please regenerate the affected output files. Do NOT "
+                            "skip this — the corrupted files will fail verification.",
+                            timeout=3600.0,
+                        )
+                        raw_result = await child.get_last_response_text()
+                        continue
+
                     if malfunction_counts >= MAX_VERIFIER_MALFUNCTIONS + 1:
                         attempt_counts += 1
                         malfunction_counts = 0
@@ -564,7 +797,7 @@ def build_skill_tool(
                                 Path(working_directory),
                             )
                             raise VerificationExhaustedError(skill_name, trace_path)
-                    # Re-run verification only (malfunction is verifier's fault)
+                    # Re-run verification only (non-tamper malfunction is verifier's fault)
                     continue
                 else:
                     # FAIL or PARTIAL — send feedback to same child
@@ -593,7 +826,7 @@ def build_skill_tool(
                     await child.send_and_wait(
                         f"## VERIFICATION FAILED\n\n{feedback}\n\n"
                         f"Fix the issues above and ensure all outputs are correct.",
-                        timeout=1800.0,
+                        timeout=3600.0,
                     )
                     raw_result = await child.get_last_response_text()
                     continue
@@ -601,6 +834,60 @@ def build_skill_tool(
             # Safety net
             return ToolResult(
                 text_result_for_llm=f"Error: skill '{skill_name}' loop exceeded safety limit.",
+                result_type="error",
+            )
+        except VerificationExhaustedError as vex:
+            # Build rich feedback for the orchestrator so it knows what
+            # went wrong and can decide how to proceed.
+            feedback_parts = [
+                f"Skill '{skill_name}' FAILED verification after "
+                f"{MAX_VERIFICATION_ATTEMPTS} attempts.",
+                "",
+            ]
+            # Include the last failed checks so the orchestrator knows
+            # *what* couldn't be fixed
+            if attempt_history:
+                last = attempt_history[-1]
+                last_checks = last.get("failed_checks", [])
+                if last_checks:
+                    feedback_parts.append("Last verification found these unresolved issues:")
+                    for fc in last_checks:
+                        feedback_parts.append(f"  - {fc.get('check', '?')}")
+                    feedback_parts.append("")
+
+                # Summarize attempt pattern (tamper vs real failures)
+                tampers = sum(
+                    1 for a in attempt_history
+                    if a.get("verdict") == "MALFUNCTION"
+                    and "tamper" in a.get("raw_output", "").lower()
+                )
+                fails = sum(
+                    1 for a in attempt_history
+                    if a.get("verdict") in ("FAIL", "PARTIAL")
+                )
+                if tampers:
+                    feedback_parts.append(
+                        f"({tampers} attempt(s) lost to verifier tampering, "
+                        f"{fails} actual verification failure(s))"
+                    )
+                    feedback_parts.append("")
+
+            feedback_parts.extend([
+                f"Failure trace saved to: {vex.trace_path}",
+                "",
+                "Options:",
+                f"  1. Re-invoke with force=true: InvokeSkill(skill=\"{skill_name}\", force=true)",
+                "     This starts the skill from scratch with a fresh child agent.",
+                "  2. Try a different approach in the context/instructions.",
+                "  3. Skip this skill if it's non-critical.",
+            ])
+
+            _skill_logger.error(
+                "EXHAUSTED %s — verification failed after %d attempts",
+                skill_name, MAX_VERIFICATION_ATTEMPTS,
+            )
+            return ToolResult(
+                text_result_for_llm="\n".join(feedback_parts),
                 result_type="error",
             )
         finally:
@@ -644,7 +931,52 @@ COMPLETE_SKILL_PARAMETERS: dict[str, Any] = {
     "required": ["skill", "output_summary"],
 }
 
-MIN_OUTPUT_BYTES = 1_000  # reject empty/placeholder outputs
+MIN_OUTPUT_BYTES = 100  # reject empty/placeholder outputs (real output is always >100B)
+MAX_LEARNINGS_RETRIES = 2
+LEARNINGS_DIR = "learnings"
+SCRIPTS_DIR = "scripts"
+MAX_SCRIPTS_RETRIES = 1
+
+
+def _request_save_scripts_prompt(skill_name: str, working_directory: str) -> tuple[str, Path]:
+    """Build the prompt asking the child to save its working scripts."""
+    scripts_dir = Path(working_directory) / SCRIPTS_DIR / skill_name
+    prompt = (
+        "## Save Your Working Scripts\n\n"
+        "Verification passed. Before writing learnings, save the scripts that produced "
+        "your final outputs.\n\n"
+        f"Save them to `{SCRIPTS_DIR}/{skill_name}/`. Include only scripts that someone "
+        "could re-run to reproduce your outputs — not exploratory snippets or one-off "
+        "queries. Each script should be self-contained with clear input parameters "
+        "(file paths, dates, config values) so a future run can adapt and reuse them.\n\n"
+        f"Create the `{SCRIPTS_DIR}/{skill_name}/` directory if it doesn't exist.\n\n"
+        "If you didn't write discrete scripts (e.g., you ran everything inline), "
+        "extract the key logic into runnable .py files now."
+    )
+    return prompt, scripts_dir
+
+
+def _request_learnings_prompt(skill_name: str, run_tag: str | None, working_directory: str) -> tuple[str, Path]:
+    """Build the learnings request prompt and expected file path."""
+    tag_suffix = f"_{run_tag}" if run_tag else ""
+    filename = f"{skill_name}{tag_suffix}.md"
+    learnings_dir = Path(working_directory) / LEARNINGS_DIR
+    expected_path = learnings_dir / filename
+
+    prompt = (
+        "## Write Your Learnings\n\n"
+        "Verification passed. Before completing, write your learnings for this run.\n\n"
+        f"1. Check if prior learnings exist at `{LEARNINGS_DIR}/{skill_name}_*.md` "
+        "and read them to see what's already been captured.\n"
+        f"2. Write your new learnings to `{LEARNINGS_DIR}/{filename}`.\n\n"
+        "Write what was interesting, hard, surprising. Structural knowledge about the "
+        "data, gotchas, things that would help a future run go faster or avoid mistakes. "
+        "Don't repeat what prior learnings already captured unless you're updating or "
+        "correcting something. If prior learnings exist, BUILD ON THEM — update, correct, "
+        "or add new insights.\n\n"
+        f"Create the `{LEARNINGS_DIR}/` directory if it doesn't exist."
+    )
+    return prompt, expected_path
 
 
 def _run_async(coro: Any) -> Any:
@@ -787,6 +1119,38 @@ def build_complete_skill_tool(
 
             # Run verification (pass current attempt number for log naming)
             current_attempt = _attempt_counts[skill_name] + 1
+
+            def _cs_verifier_event_handler(event) -> None:
+                """Log CompleteSkill verifier events for visibility."""
+                try:
+                    if isinstance(event, dict):
+                        raw_type = event.get("type", "")
+                    else:
+                        raw_type = getattr(event, "type", "")
+                    etype = raw_type.value if hasattr(raw_type, "value") else str(raw_type)
+                except Exception:
+                    return
+                def _vget(key, default=""):
+                    if isinstance(event, dict):
+                        data = event.get("data", {})
+                        return data.get(key, default) if isinstance(data, dict) else default
+                    data = getattr(event, "data", None)
+                    if data is None:
+                        return default
+                    if isinstance(data, dict):
+                        return data.get(key, default)
+                    return getattr(data, key, default)
+                if etype == "tool.execution_start":
+                    _skill_logger.info("VERIFY %s — tool: %s", skill_name, _vget("tool_name", "?"))
+                elif etype == "tool.execution_complete":
+                    error = _vget("error")
+                    if error:
+                        _skill_logger.warning(
+                            "VERIFY %s — tool DONE (error): %s — %s",
+                            skill_name, _vget("tool_name", "?"), str(error)[:200],
+                        )
+
+            history = _attempt_history.get(skill_name, [])
             vresult = await run_verification(
                 skill_name=skill_name,
                 skill_content=skill_content,
@@ -795,6 +1159,8 @@ def build_complete_skill_tool(
                 fork_child=session.fork_child,
                 prior_metrics=prior_metrics,
                 attempt_num=current_attempt,
+                on_event=_cs_verifier_event_handler,
+                prior_attempts=history if history else None,
             )
 
             if vresult.passed:

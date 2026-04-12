@@ -211,6 +211,7 @@ def _core_operating_rules() -> tuple[str, ...]:
         "For risky, destructive, or externally visible actions, pause and confirm unless the user already gave durable authorization.",
         "Prefer the smallest complete change over a half-finished implementation or a gold-plated rewrite.",
         "When starting a task, check available skills using the InvokeSkill tool. Execute matching skills via InvokeSkill instead of doing the work yourself — the skill runs in an isolated session with full methodology loaded.",
+        "CRITICAL: You MUST use InvokeSkill for ALL skill work. NEVER use the /skill slash command to load skill content into this session. NEVER do skill work (writing scripts, creating output files, running analysis) directly. NEVER call CompleteSkill from the orchestrator session. The /skill command is blocked for workspace skills.",
         "After a skill completes, check if downstream skills are now unblocked and invoke them. Do not stop until all skills in the dependency chain are complete.",
         'When a skill declares `requires: <type>`, its prerequisite must be completed first. InvokeSkill will enforce this.',
     )

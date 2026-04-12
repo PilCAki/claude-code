@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 import sys
 import uuid
 
 import pytest
+
+# Provide a default model for tests so CopilotCodeConfig() doesn't require
+# an explicit model= in every test.  Production code still requires it.
+os.environ.setdefault("COPILOTCODE_TEST_DEFAULT_MODEL", "claude-sonnet-4.6")
 
 
 @pytest.fixture

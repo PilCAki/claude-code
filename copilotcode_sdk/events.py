@@ -86,11 +86,26 @@ def tool_denied(*, tool_name: str, reason: str) -> Event:
     return Event(EventType.tool_denied, data={"tool_name": tool_name, "reason": reason})
 
 
-def cost_accumulated(*, total_cost: float, turn_cost: float, model: str = "") -> Event:
+def cost_accumulated(
+    *,
+    total_cost: float,
+    turn_cost: float,
+    model: str = "",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    source: str = "main",
+) -> Event:
     return Event(EventType.cost_accumulated, data={
         "total_cost": total_cost,
         "turn_cost": turn_cost,
         "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "source": source,
     })
 
 

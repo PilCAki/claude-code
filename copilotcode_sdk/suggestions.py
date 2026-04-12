@@ -201,7 +201,7 @@ async def build_predictive_suggestions(
                 transcript_tail=transcript_tail[:15_000],
                 session_state=str(session_state)[:2_000],
             )
-            result = await session.send_and_wait(prompt, timeout=30.0)
+            result = await session.send_and_wait(prompt, timeout=3600.0)
             text = ""
             if isinstance(result, str):
                 text = result

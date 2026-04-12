@@ -214,7 +214,7 @@ def build_task_tools(store: TaskStore) -> list[Any]:
                 result_type="error",
             )
         block = args.get("block", True)
-        timeout = float(args.get("timeout", 300))
+        timeout = float(args.get("timeout", 3600))
 
         # Non-blocking check
         output = store.read_task_output(task_id)

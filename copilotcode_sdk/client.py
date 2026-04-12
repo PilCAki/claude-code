@@ -26,7 +26,9 @@ from .prompt_compiler import (
 from .reports import CheckResult, PreflightReport, SmokeTestReport
 from .skill_assets import build_skill_catalog
 from .events import (
+    Event,
     EventBus,
+    EventType,
     cost_accumulated as _cost_event,
     model_switched as _model_switched_event,
     session_destroyed as _session_destroyed_event,
@@ -59,6 +61,66 @@ def _load_copilot_sdk() -> tuple[Any, Any, Any, Any]:
             "Install it with `pip install github-copilot-sdk`.",
         ) from exc
     return CopilotClient, PermissionHandler, SubprocessConfig, copilot
+
+
+import logging as _logging
+
+_model_logger = _logging.getLogger("copilotcode_sdk.model_check")
+
+
+class ModelMismatchError(RuntimeError):
+    """Raised when the model actually used doesn't match what was requested."""
+
+
+def _verify_model_match(requested: str, actual: str) -> None:
+    """CHECK 2: Verify the model reported by the API matches what was requested.
+
+    The Copilot CLI silently falls back to its default model (e.g. gpt-5-mini)
+    if the requested model isn't available. This check catches that at runtime.
+    """
+    req = requested.lower().strip()
+    act = actual.lower().strip()
+
+    # Direct match or the actual model starts with the requested model
+    if req == act or act.startswith(req):
+        _model_logger.info("Model verified: requested=%s, actual=%s", requested, actual)
+        return
+
+    # Check model family match — e.g. "claude-sonnet-4.6" should match
+    # "claude-sonnet-4.6-20250514" or similar versioned variants
+    req_parts = req.replace(".", "-").split("-")
+    act_parts = act.replace(".", "-").split("-")
+
+    # If the requested model's key tokens are all present in the actual model
+    # (handles version suffix differences), that's OK
+    if all(part in act_parts for part in req_parts if len(part) > 1):
+        _model_logger.info("Model verified (family match): requested=%s, actual=%s", requested, actual)
+        return
+
+    # Check provider family mismatch — this is the critical case.
+    # If you asked for Claude but got GPT (or vice versa), that's a hard error.
+    req_is_anthropic = any(t in req for t in ("claude", "sonnet", "opus", "haiku"))
+    act_is_anthropic = any(t in act for t in ("claude", "sonnet", "opus", "haiku"))
+    req_is_openai = any(t in req for t in ("gpt", "o1", "o3", "o4"))
+    act_is_openai = any(t in act for t in ("gpt", "o1", "o3", "o4"))
+
+    if req_is_anthropic != act_is_anthropic or req_is_openai != act_is_openai:
+        msg = (
+            f"CRITICAL MODEL MISMATCH: Requested '{requested}' but the API is "
+            f"actually using '{actual}'. The Copilot CLI likely fell back to its "
+            f"default model because the requested model isn't available. "
+            f"Check your provider configuration."
+        )
+        _model_logger.error(msg)
+        raise ModelMismatchError(msg)
+
+    # Non-family mismatch — warn loudly but don't crash
+    # (could be a minor version difference within the same provider)
+    _model_logger.warning(
+        "Model mismatch WARNING: requested=%s, actual=%s — "
+        "verify this is the intended model",
+        requested, actual,
+    )
 
 
 def _last_turn_has_tool_calls(messages: list[Any]) -> bool:
@@ -143,6 +205,7 @@ class CopilotCodeSession:
         copilot_client: Any = None,
         model: str | None = None,
         task_store: "TaskStore | None" = None,
+        source: str = "main",
     ) -> None:
         self._session = session
         self._memory_store = memory_store
@@ -159,6 +222,18 @@ class CopilotCodeSession:
         self._subagent_context: SubagentContext | None = None
         self._drain_skills: Callable[[], list[dict[str, Any]]] | None = None
         self._completed_skills: set[str] | None = None
+        self._raw_hooks: dict[str, Any] | None = None
+        self._skill_map: dict[str, dict[str, str]] | None = None
+        self._model_verified: bool = False  # CHECK 2: runtime model verification
+        self._on_event_callback: Any | None = None  # harness-level event callback
+        self._source: str = source  # lineage tag: "main", "verifier", "maintenance", etc.
+
+        # Register for ASSISTANT_USAGE events on the raw session so we
+        # capture token counts that send_and_wait() doesn't return.
+        self._unsubscribe_usage = self._session.on(self._on_sdk_event)
+
+        # Auto-subscribe a cost logger so every session type is visible.
+        self._event_bus.subscribe(self._log_cost_event, event_type=EventType.cost_accumulated)
 
     @property
     def raw_session(self) -> "SDKCopilotSession":
@@ -191,6 +266,11 @@ class CopilotCodeSession:
     def completed_skills(self) -> set[str]:
         """Skills that have been marked complete via CompleteSkill."""
         return self._completed_skills if self._completed_skills is not None else set()
+
+    @property
+    def skill_map(self) -> dict[str, dict[str, str]]:
+        """The skill catalog for this session (skill_name -> frontmatter)."""
+        return self._skill_map if self._skill_map is not None else {}
 
     @property
     def active_model(self) -> str | None:
@@ -325,11 +405,175 @@ class CopilotCodeSession:
             # policy already governs what's allowed.
             "on_permission_request": PermissionHandler.approve_all,
         }
-        # Wire child events to the same callback so callers get visibility
-        if on_event is not None:
-            create_kwargs["on_event"] = on_event
+        # Wire child events: always intercept for usage accumulation,
+        # and forward to caller's on_event if provided.
+        parent_session = self
+        parent_state = self._state
+        parent_model = self._model
+        caller_on_event = on_event
+        _child_model_verified = False  # CHECK 3: verify child model matches parent
+
+        # Also grab the parent's harness-level callback for child event forwarding
+        _parent_harness_callback = getattr(parent_session, '_on_event_callback', None)
+
+        def _child_event_proxy(event: Any) -> None:
+            nonlocal _child_model_verified
+            # Accumulate child usage/cost into parent totals.
+            #
+            # Events arrive here as dicts (from Event.to_dict() via the child's
+            # event bus subscriber).  The child session already processes raw
+            # assistant.usage events and emits cost.accumulated events on its
+            # own event bus — so we intercept *those* here, not assistant.usage.
+            try:
+                if isinstance(event, dict):
+                    etype = event.get("type", "")
+                else:
+                    etype = getattr(event, "type", "")
+                    if hasattr(etype, "value"):
+                        etype = etype.value
+
+                if etype == "cost.accumulated":
+                    # Child already computed turn_cost — bubble it up to parent
+                    _get = (lambda k, d=0: event.get(k, d)) if isinstance(event, dict) else (lambda k, d=0: getattr(event, k, d))
+                    turn_cost_val = float(_get("turn_cost", 0) or 0)
+                    model = _get("model", "") or parent_model
+                    child_in = int(_get("input_tokens", 0) or 0)
+                    child_out = int(_get("output_tokens", 0) or 0)
+                    child_cr = int(_get("cache_read_tokens", 0) or 0)
+                    child_cw = int(_get("cache_write_tokens", 0) or 0)
+                    child_source = _get("source", "") or spec.role or "child"
+
+                    if turn_cost_val > 0:
+                        # CHECK 3: verify child is using the same model
+                        if model and not _child_model_verified and parent_model:
+                            _child_model_verified = True
+                            _verify_model_match(parent_model, str(model))
+
+                        # Use token-level cost calculation for accurate breakdown
+                        child_turn = calculate_cost(
+                            str(model),
+                            input_tokens=child_in,
+                            output_tokens=child_out,
+                            cache_read_tokens=child_cr,
+                            cache_creation_tokens=child_cw,
+                        )
+                        parent_session._cumulative_cost = UsageCost(
+                            input_cost=parent_session._cumulative_cost.input_cost + child_turn.input_cost,
+                            output_cost=parent_session._cumulative_cost.output_cost + child_turn.output_cost,
+                            cache_read_cost=parent_session._cumulative_cost.cache_read_cost + child_turn.cache_read_cost,
+                            cache_creation_cost=parent_session._cumulative_cost.cache_creation_cost + child_turn.cache_creation_cost,
+                        )
+                        parent_session._event_bus.emit(_cost_event(
+                            total_cost=parent_session._cumulative_cost.total,
+                            turn_cost=turn_cost_val,
+                            model=str(model),
+                            input_tokens=child_in,
+                            output_tokens=child_out,
+                            cache_read_tokens=child_cr,
+                            cache_write_tokens=child_cw,
+                            source=str(child_source),
+                        ))
+
+                # Forward child events to parent's harness callback so the
+                # harness can log child activity (tool calls, turns, etc.)
+                if _parent_harness_callback is not None:
+                    try:
+                        if isinstance(event, dict):
+                            tagged = {**event, "type": f"child.{etype}"}
+                        else:
+                            tagged = {"type": f"child.{etype}"}
+                            for attr in ("tool_name", "arguments", "result",
+                                         "error", "turn_count", "session_id",
+                                         "total_cost", "turn_cost", "model",
+                                         "message", "tool_call_id"):
+                                val = getattr(event, attr, None)
+                                if val is not None:
+                                    tagged[attr] = val
+                            # Also try .data for SDK event objects
+                            data = getattr(event, "data", None)
+                            if data is not None:
+                                for attr in ("tool_name", "arguments", "result",
+                                             "error", "turn_count", "session_id",
+                                             "input_tokens", "output_tokens",
+                                             "cache_read_tokens", "cache_write_tokens",
+                                             "model"):
+                                    val = getattr(data, attr, None)
+                                    if val is not None:
+                                        tagged[attr] = val
+                        tagged["_child_role"] = spec.role or "child"
+                        _parent_harness_callback(tagged)
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+            # Forward to caller's handler
+            if caller_on_event is not None:
+                try:
+                    caller_on_event(event)
+                except Exception:
+                    pass
+
+        create_kwargs["on_event"] = _child_event_proxy
+
+        # --- Child stuck-loop detection ---
+        # Children don't inherit parent hooks, so wire a lightweight
+        # on_post_tool_use that detects repeated failures and injects
+        # guidance telling the model to try a different approach.
+        _child_failures: dict[str, int] = {}
+        _CHILD_FAIL_THRESHOLD = 3
+
+        def _child_post_tool(input_data: dict, _env: dict) -> dict | None:
+            tool_result = input_data.get("toolResult")
+            tool_name = str(input_data.get("toolName", ""))
+            # Detect error in result
+            err = None
+            if isinstance(tool_result, dict):
+                err = tool_result.get("error") or tool_result.get("stderr")
+            elif isinstance(tool_result, str) and "error" in tool_result.lower()[:50]:
+                err = tool_result
+            raw_err = input_data.get("error")
+            if not err and raw_err:
+                err = str(raw_err)
+
+            if err:
+                key = f"{tool_name}:{str(err)[:80]}"
+                _child_failures[key] = _child_failures.get(key, 0) + 1
+                if _child_failures[key] >= _CHILD_FAIL_THRESHOLD:
+                    _child_failures[key] = 0
+                    return {
+                        "additionalContext": (
+                            "<system-reminder>\n"
+                            f"STUCK LOOP DETECTED: `{tool_name}` has failed "
+                            f"{_CHILD_FAIL_THRESHOLD} times with the same error:\n"
+                            f"  {str(err)[:120]}\n\n"
+                            "Repeating the same approach will not work. Stop and "
+                            "diagnose: why is this failing? What is different about "
+                            "what you're sending vs what the tool expects?\n\n"
+                            "You MUST try a fundamentally different strategy. "
+                            "If you're trying to create or write a file, consider:\n"
+                            "- Writing via a shell command instead\n"
+                            "- Breaking the work into smaller steps\n"
+                            "- Using a different tool entirely\n"
+                            "- Simplifying what you're producing\n"
+                            "</system-reminder>"
+                        ),
+                    }
+            else:
+                # Clear failures for this tool on success
+                for k in [k for k in _child_failures if k.startswith(f"{tool_name}:")]:
+                    del _child_failures[k]
+            return None
+
+        create_kwargs["hooks"] = {"on_post_tool_use": _child_post_tool}
+
         if spec.tools:
             create_kwargs["available_tools"] = list(spec.tools)
+        # Pass the parent's model to the child so it doesn't fall back
+        # to the CLI default. Without this, the child silently uses a
+        # different model than the parent.
+        if self._model:
+            create_kwargs["model"] = self._model
         child = await self._copilot_client.create_session(**create_kwargs)
         child_id = getattr(child, "session_id", None) or "child"
         self._subagent_context.register_child(child_id)
@@ -468,12 +712,20 @@ class CopilotCodeSession:
         prompt: str,
         *,
         completion_check: Callable[[], list[str]] | None = None,
+        holistic_check: Callable[[], Any] | None = None,
         max_continuations: int = 5,
+        max_holistic_retries: int = 2,
         continuation_template: str = (
             "You have NOT completed all skills. "
             "The following output directories are still missing or empty: {missing}. "
             "Continue executing skills in dependency order using InvokeSkill. "
             "Do not stop until all skills are complete and all output directories have content."
+        ),
+        holistic_feedback_template: str = (
+            "## HOLISTIC VERIFICATION FAILED\n\n"
+            "{feedback}\n\n"
+            "Re-invoke the affected skill(s) with force=true to fix these issues. "
+            "Do not stop until all cross-skill issues are resolved."
         ),
         timeout: float = 3600.0,
     ) -> Any:
@@ -483,22 +735,73 @@ class CopilotCodeSession:
         it returns a non-empty list of missing items, a continuation prompt is
         sent with those items interpolated via ``{missing}`` in the template.
 
+        If ``holistic_check`` is provided, it runs after all structural checks
+        pass. This spawns a cross-skill verifier that checks pipeline-level
+        consistency. On failure, feedback is sent to the orchestrator session
+        which can re-invoke skills with ``force=true``.
+
         Returns the final result once all checks pass or
         ``max_continuations`` is exhausted.
         """
         result = await self.send_and_wait(prompt, timeout=timeout)
 
-        if completion_check is None:
+        if completion_check is None and holistic_check is None:
             return result
 
-        for attempt in range(1, max_continuations + 1):
-            missing = completion_check()
-            if not missing:
-                break
-            continuation = continuation_template.format(
-                missing=", ".join(missing),
-            )
-            result = await self.send_and_wait(continuation, timeout=timeout)
+        # --- Phase 1: Structural completion ---
+        if completion_check is not None:
+            for attempt in range(1, max_continuations + 1):
+                missing = completion_check()
+                if not missing:
+                    break
+                continuation = continuation_template.format(
+                    missing=", ".join(missing),
+                )
+                result = await self.send_and_wait(continuation, timeout=timeout)
+
+        # --- Phase 2: Holistic cross-skill verification ---
+        if holistic_check is not None:
+            import logging as _logging
+            from .holistic_verifier import format_holistic_feedback
+
+            _h_logger = _logging.getLogger("copilotcode.holistic_verifier")
+            max_holistic_malfunctions = 2
+
+            for h_attempt in range(1, max_holistic_retries + max_holistic_malfunctions + 1):
+                h_result = await holistic_check()
+                if h_result.passed:
+                    break
+                if h_result.is_malfunction:
+                    max_holistic_malfunctions -= 1
+                    _h_logger.warning(
+                        "Holistic verifier MALFUNCTION (attempt %d, %d retries left): %s",
+                        h_attempt, max_holistic_malfunctions,
+                        h_result.raw_output[:300],
+                    )
+                    if max_holistic_malfunctions <= 0:
+                        _h_logger.error(
+                            "Holistic verifier exhausted malfunction retries"
+                        )
+                        break
+                    continue  # retry — don't send feedback to orchestrator
+                feedback = format_holistic_feedback(h_result)
+                result = await self.send_and_wait(
+                    holistic_feedback_template.format(feedback=feedback),
+                    timeout=timeout,
+                )
+                # After orchestrator fixes, re-check structural completeness
+                if completion_check is not None:
+                    for attempt in range(1, max_continuations + 1):
+                        missing = completion_check()
+                        if not missing:
+                            break
+                        result = await self.send_and_wait(
+                            continuation_template.format(
+                                missing=", ".join(missing),
+                            ),
+                            timeout=timeout,
+                        )
+
         return result
 
     async def get_messages(self) -> list[Any]:
@@ -542,8 +845,83 @@ class CopilotCodeSession:
             context_tokens=context_tokens,
         )
 
+    def _log_cost_event(self, event: Event) -> None:
+        """Log every cost event to the Python logger for full visibility."""
+        import logging
+        logger = logging.getLogger("copilotcode.cost")
+        d = event.data
+        logger.info(
+            "[%s] model=%s turn=$%.6f total=$%.6f "
+            "in=%d out=%d cache_r=%d cache_w=%d",
+            d.get("source", self._source),
+            d.get("model", "?"),
+            d.get("turn_cost", 0),
+            d.get("total_cost", 0),
+            d.get("input_tokens", 0),
+            d.get("output_tokens", 0),
+            d.get("cache_read_tokens", 0),
+            d.get("cache_write_tokens", 0),
+        )
+
+    def _on_sdk_event(self, event: Any) -> None:
+        """Handle raw SDK session events — primarily ASSISTANT_USAGE."""
+        try:
+            etype = getattr(event, "type", None)
+            if etype is not None and hasattr(etype, "value"):
+                etype = etype.value
+            if etype != "assistant.usage":
+                return
+            data = getattr(event, "data", None)
+            if data is None:
+                return
+            input_tokens = int(getattr(data, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(data, "output_tokens", 0) or 0)
+            cache_read = int(getattr(data, "cache_read_tokens", 0) or 0)
+            cache_write = int(getattr(data, "cache_write_tokens", 0) or 0)
+            if not (input_tokens or output_tokens or cache_read or cache_write):
+                return
+            self._state.record_usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_write,
+            )
+            model = getattr(data, "model", None) or self._model
+            # CHECK 2: On first usage event, verify the model actually used
+            # matches what was requested. The Copilot CLI silently falls back
+            # to its default model if the requested model isn't available.
+            if model and not self._model_verified and self._model:
+                self._model_verified = True
+                _verify_model_match(self._model, str(model))
+            if model:
+                turn_cost = calculate_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read,
+                    cache_creation_tokens=cache_write,
+                )
+                self._cumulative_cost = UsageCost(
+                    input_cost=self._cumulative_cost.input_cost + turn_cost.input_cost,
+                    output_cost=self._cumulative_cost.output_cost + turn_cost.output_cost,
+                    cache_read_cost=self._cumulative_cost.cache_read_cost + turn_cost.cache_read_cost,
+                    cache_creation_cost=self._cumulative_cost.cache_creation_cost + turn_cost.cache_creation_cost,
+                )
+                self._event_bus.emit(_cost_event(
+                    total_cost=self._cumulative_cost.total,
+                    turn_cost=turn_cost.total,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    source=self._source,
+                ))
+        except Exception:
+            pass  # Never let usage tracking break the session
+
     def _accumulate_usage(self, result: Any) -> None:
-        """Extract token usage from SDK result and accumulate cost."""
+        """Extract token usage from SDK result and accumulate cost (fallback path)."""
         # Convert SessionEvent to dict if needed (SDK returns dataclass objects)
         if hasattr(result, "to_dict"):
             result = result.to_dict()
@@ -580,6 +958,11 @@ class CopilotCodeSession:
                 total_cost=self._cumulative_cost.total,
                 turn_cost=turn_cost.total,
                 model=self._model or "",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_create,
+                source=self._source,
             ))
 
     async def _maybe_run_session_memory(self) -> None:
@@ -615,6 +998,9 @@ class CopilotCodeSession:
 
         When a subagent context exists, the maintenance session shares the
         parent's cacheable prefix for API cache hits.
+
+        Token usage from maintenance sessions is proxied back to the parent
+        so that extraction/compaction costs are visible in cost logs.
         """
         if self._copilot_client is None:
             raise RuntimeError("No copilot client available for maintenance session")
@@ -629,9 +1015,56 @@ class CopilotCodeSession:
                     "Respond only with the updated notes document."
                 ),
             }
+
+        # Proxy maintenance session usage events back to the parent so
+        # extraction/compaction costs show up in the parent's cost log.
+        parent = self
+
+        def _maintenance_usage_proxy(raw_event: Any) -> None:
+            try:
+                etype = getattr(raw_event, "type", None)
+                if etype is not None and hasattr(etype, "value"):
+                    etype = etype.value
+                if etype != "assistant.usage":
+                    return
+                data = getattr(raw_event, "data", None)
+                if data is None:
+                    return
+                in_t = int(getattr(data, "input_tokens", 0) or 0)
+                out_t = int(getattr(data, "output_tokens", 0) or 0)
+                cr_t = int(getattr(data, "cache_read_tokens", 0) or 0)
+                cw_t = int(getattr(data, "cache_write_tokens", 0) or 0)
+                if not (in_t or out_t or cr_t or cw_t):
+                    return
+                model = getattr(data, "model", None) or parent._model
+                if model:
+                    turn = calculate_cost(
+                        model, input_tokens=in_t, output_tokens=out_t,
+                        cache_read_tokens=cr_t, cache_creation_tokens=cw_t,
+                    )
+                    parent._cumulative_cost = UsageCost(
+                        input_cost=parent._cumulative_cost.input_cost + turn.input_cost,
+                        output_cost=parent._cumulative_cost.output_cost + turn.output_cost,
+                        cache_read_cost=parent._cumulative_cost.cache_read_cost + turn.cache_read_cost,
+                        cache_creation_cost=parent._cumulative_cost.cache_creation_cost + turn.cache_creation_cost,
+                    )
+                    parent._event_bus.emit(_cost_event(
+                        total_cost=parent._cumulative_cost.total,
+                        turn_cost=turn.total,
+                        model=str(model),
+                        input_tokens=in_t,
+                        output_tokens=out_t,
+                        cache_read_tokens=cr_t,
+                        cache_write_tokens=cw_t,
+                        source="maintenance",
+                    ))
+            except Exception:
+                pass
+
         session = await self._copilot_client.create_session(
             system_message=system_message,
             on_permission_request=lambda _: True,  # auto-approve (text-only session)
+            on_event=_maintenance_usage_proxy,
         )
         if self._subagent_context is not None:
             child_id = getattr(session, "session_id", None) or "maintenance"
@@ -662,7 +1095,7 @@ class CopilotCodeSession:
 
         maintenance = await self._create_maintenance_session()
         try:
-            event = await maintenance.send_and_wait(full_prompt, timeout=600.0)
+            event = await maintenance.send_and_wait(full_prompt, timeout=3600.0)
             messages = _normalize_sdk_messages(await maintenance.get_messages())
             # Extract the last assistant message text
             response_text = ""
@@ -801,7 +1234,7 @@ class CopilotCodeClient:
         *,
         live: bool = False,
         prompt: str = "Reply with the single word OK.",
-        timeout: float = 300.0,
+        timeout: float = 3600.0,
         save_report_path: str | Path | None = None,
         save_transcript_dir: str | Path | None = None,
     ) -> SmokeTestReport:
@@ -910,6 +1343,9 @@ class CopilotCodeClient:
             model=self.config.model,
             task_store=task_store,
         )
+        # Use the event bus created in _session_kwargs (already wired to hooks)
+        if captured.get("_event_bus") is not None:
+            wrapped._event_bus = captured["_event_bus"]
         # Share the cacheable prefix with child sessions
         if self._assembler is not None:
             wrapped.set_cacheable_prefix(self._assembler.render(cacheable_only=True))
@@ -917,6 +1353,7 @@ class CopilotCodeClient:
         event_callback = on_event or self.config.on_event
         if event_callback is not None:
             wrapped.event_bus.subscribe(lambda e: event_callback(e.to_dict()))
+            wrapped._on_event_callback = event_callback
         wrapped.event_bus.emit(_session_started_event(
             session_id=wrapped.session_id or "", source="create",
         ))
@@ -926,10 +1363,12 @@ class CopilotCodeClient:
             wrapped._instruction_bundle = captured["instructionsLoaded"]
         # Wire skill execution plumbing
         raw_hooks = captured.get("_raw_hooks", {})
+        wrapped._raw_hooks = raw_hooks
         drain_fn = raw_hooks.get("drain_pending_skill_invocations")
         if drain_fn is not None:
             wrapped._drain_skills = drain_fn
         wrapped._completed_skills = captured.get("_completed_skills")
+        wrapped._skill_map = captured.get("_skill_map")
         # Wire session into CompleteSkill's verification gate
         session_holder = captured.get("_session_holder")
         if session_holder is not None and isinstance(session_holder, list):
@@ -957,6 +1396,9 @@ class CopilotCodeClient:
             model=self.config.model,
             task_store=task_store,
         )
+        # Use the event bus created in _session_kwargs (already wired to hooks)
+        if captured.get("_event_bus") is not None:
+            wrapped._event_bus = captured["_event_bus"]
         # Restore cacheable prefix so resumed sessions can fork children
         if self._assembler is not None:
             wrapped.set_cacheable_prefix(self._assembler.render(cacheable_only=True))
@@ -972,10 +1414,12 @@ class CopilotCodeClient:
             wrapped._instruction_bundle = captured["instructionsLoaded"]
         # Wire skill execution plumbing
         raw_hooks = captured.get("_raw_hooks", {})
+        wrapped._raw_hooks = raw_hooks
         drain_fn = raw_hooks.get("drain_pending_skill_invocations")
         if drain_fn is not None:
             wrapped._drain_skills = drain_fn
         wrapped._completed_skills = captured.get("_completed_skills")
+        wrapped._skill_map = captured.get("_skill_map")
         # Wire session into CompleteSkill's verification gate
         session_holder = captured.get("_session_holder")
         if session_holder is not None and isinstance(session_holder, list):
@@ -1017,6 +1461,8 @@ class CopilotCodeClient:
         )
         # Single shared set so hooks and InvokeSkill see the same completions
         _shared_completed_skills: set[str] = set()
+        # Create event bus early so hooks can emit events from the start
+        _session_event_bus = EventBus()
         raw_hooks = build_default_hooks(
             self.config, self._memory_store,
             skill_map=skill_map,
@@ -1024,12 +1470,15 @@ class CopilotCodeClient:
             assembler=self._assembler,
             completed_skills=_shared_completed_skills,
             session_memory_controller=self._smc,
+            event_bus=_session_event_bus,
         )
 
         # Wrap on_session_start to inject source/session_id and capture initialUserMessage
         _captured: dict[str, Any] = {
             "_completed_skills": _shared_completed_skills,
             "_raw_hooks": raw_hooks,
+            "_event_bus": _session_event_bus,
+            "_skill_map": skill_map,
         }
         original_session_start = raw_hooks.get("on_session_start")
 
@@ -1102,6 +1551,7 @@ class CopilotCodeClient:
                 working_directory=str(self.config.working_path),
                 completed_skills=completed_skills,
                 session_holder=session_holder,
+                run_tag=self.config.run_tag,
             ))
             tools_list.append(build_complete_skill_tool(
                 skill_map=skill_map,

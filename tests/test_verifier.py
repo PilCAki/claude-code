@@ -288,6 +288,87 @@ class TestBuildVerifierPrompt:
         assert "Do NOT implement" in prompt
 
 
+    def test_prior_attempts_tamper_warning(self):
+        """Tamper history produces emphatic warning about not writing to output dir."""
+        prompt = build_verifier_prompt(
+            skill_content="# Skill",
+            output_dir="/out",
+            prior_metrics=None,
+            prior_attempts=[{
+                "verdict": "MALFUNCTION",
+                "raw_output": "TAMPER: Verifier tampered with output files: check.py",
+            }],
+        )
+        assert "PRIOR VERIFICATION ATTEMPTS" in prompt
+        assert "TERMINATED" in prompt
+        assert "STRICTLY FORBIDDEN" in prompt
+        assert "NEVER create, modify, or write ANY files" in prompt
+        assert "temp" in prompt.lower()
+
+    def test_prior_attempts_fail_checks(self):
+        """Prior FAIL attempts list the checks that failed."""
+        prompt = build_verifier_prompt(
+            skill_content="# Skill",
+            output_dir="/out",
+            prior_metrics=None,
+            prior_attempts=[{
+                "verdict": "FAIL",
+                "failed_checks": [
+                    {"check": "Row count mismatch"},
+                    {"check": "Schema wrong"},
+                ],
+            }],
+        )
+        assert "PRIOR VERIFICATION ATTEMPTS" in prompt
+        assert "Row count mismatch" in prompt
+        assert "Schema wrong" in prompt
+        assert "child has since attempted fixes" in prompt
+
+    def test_prior_attempts_none_no_section(self):
+        """No prior attempts means no history section in prompt."""
+        prompt = build_verifier_prompt(
+            skill_content="# Skill",
+            output_dir="/out",
+            prior_metrics=None,
+            prior_attempts=None,
+        )
+        assert "PRIOR VERIFICATION ATTEMPTS" not in prompt
+
+    def test_prior_attempts_empty_no_section(self):
+        """Empty prior attempts list means no history section."""
+        prompt = build_verifier_prompt(
+            skill_content="# Skill",
+            output_dir="/out",
+            prior_metrics=None,
+            prior_attempts=[],
+        )
+        assert "PRIOR VERIFICATION ATTEMPTS" not in prompt
+
+    def test_prior_attempts_mixed_history(self):
+        """Mixed tamper + fail history includes both types."""
+        prompt = build_verifier_prompt(
+            skill_content="# Skill",
+            output_dir="/out",
+            prior_metrics=None,
+            prior_attempts=[
+                {
+                    "verdict": "MALFUNCTION",
+                    "raw_output": "Verifier tampered with output files: script.py",
+                },
+                {
+                    "verdict": "FAIL",
+                    "failed_checks": [{"check": "Column types wrong"}],
+                },
+            ],
+        )
+        assert "Attempt 1: MALFUNCTION" in prompt
+        assert "Attempt 2: FAIL" in prompt
+        assert "TERMINATED" in prompt
+        assert "Column types wrong" in prompt
+        # Must instruct to re-check from scratch
+        assert "CURRENT state" in prompt
+
+
 class TestFormatFailFeedback:
     def test_format_with_checks(self):
         checks = [
@@ -406,7 +487,7 @@ class TestRunVerification:
             "VERDICT: PASS"
         )
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             return FakeEnforcedChild(verifier_output)
 
         result = asyncio.run(run_verification(
@@ -432,7 +513,7 @@ class TestRunVerification:
             "VERDICT: FAIL"
         )
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             return FakeEnforcedChild(verifier_output)
 
         result = asyncio.run(run_verification(
@@ -452,7 +533,7 @@ class TestRunVerification:
         output_dir.mkdir(parents=True)
         (output_dir / "data.parquet").write_bytes(b"x" * 2000)
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             return FakeEnforcedChild("I looked at the files and they seem fine.")
 
         result = asyncio.run(run_verification(
@@ -470,7 +551,7 @@ class TestRunVerification:
         output_dir.mkdir(parents=True)
         (output_dir / "data.parquet").write_bytes(b"x" * 2000)
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             return FakeEnforcedChild("VERDICT: PASS")
 
         result = asyncio.run(run_verification(
@@ -489,7 +570,7 @@ class TestRunVerification:
         data_file = output_dir / "data.parquet"
         data_file.write_bytes(b"x" * 2000)
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             data_file.write_bytes(b"TAMPERED" * 500)
             return FakeEnforcedChild(
                 "### Check: test\n**Command run:**\n  echo ok\n"
@@ -506,7 +587,37 @@ class TestRunVerification:
             prior_metrics=None,
         ))
         assert result.is_malfunction
-        assert "tamper" in result.raw_output.lower()
+        assert "modified" in result.raw_output.lower()
+
+    def test_added_scripts_cleaned_up_not_malfunction(self, tmp_path: Path):
+        """Verifier adding new scripts (not modifying existing) is OK."""
+        output_dir = tmp_path / "outputs" / "intake"
+        output_dir.mkdir(parents=True)
+        data_file = output_dir / "data.parquet"
+        data_file.write_bytes(b"x" * 2000)
+
+        async def fake_fork_child(spec, **kwargs):
+            # Verifier adds a new script but doesn't touch existing files
+            (output_dir / "verify_schema.py").write_text("print('ok')")
+            return FakeEnforcedChild(
+                "### Check: test\n**Command run:**\n  echo ok\n"
+                "**Output observed:**\n  ok\n**Result: PASS**\n\n"
+                "VERDICT: PASS"
+            )
+
+        result = asyncio.run(run_verification(
+            skill_name="excel-workbook-intake",
+            skill_content="# Intake",
+            output_dir=output_dir,
+            workspace=tmp_path,
+            fork_child=fake_fork_child,
+            prior_metrics=None,
+        ))
+        # Should PASS (not MALFUNCTION) — script was cleaned up
+        assert result.passed
+        assert not (output_dir / "verify_schema.py").exists()
+        # Original file untouched
+        assert data_file.read_bytes() == b"x" * 2000
 
     def test_fork_child_receives_correct_spec(self, tmp_path: Path):
         output_dir = tmp_path / "outputs" / "intake"
@@ -515,7 +626,7 @@ class TestRunVerification:
 
         captured_spec = None
 
-        async def fake_fork_child(spec):
+        async def fake_fork_child(spec, **kwargs):
             nonlocal captured_spec
             captured_spec = spec
             return FakeEnforcedChild(
@@ -754,3 +865,47 @@ class TestFullRetryLoop:
             result = _run(inv)
             assert "error" in result.result_type
             assert "MALFUNCTION" in result.text_result_for_llm
+
+
+# ---------------------------------------------------------------------------
+# Wave 7: VerificationResult token_usage and cost fields
+# ---------------------------------------------------------------------------
+
+
+class TestVerificationResultTokenFields:
+    """Verify VerificationResult carries token_usage and cost."""
+
+    def test_token_usage_and_cost_round_trip(self) -> None:
+        r = VerificationResult(
+            verdict="PASS",
+            raw_output="ok",
+            token_usage={"input": 1200, "output": 400, "cache_read": 50},
+            cost=0.0234,
+        )
+        assert r.token_usage["input"] == 1200
+        assert r.token_usage["output"] == 400
+        assert r.token_usage["cache_read"] == 50
+        assert r.cost == 0.0234
+
+    def test_defaults_empty(self) -> None:
+        r = VerificationResult(verdict="FAIL", raw_output="nope")
+        assert r.token_usage == {}
+        assert r.cost == 0.0
+
+    def test_passed_property_unaffected_by_cost(self) -> None:
+        r = VerificationResult(
+            verdict="PASS", raw_output="ok", cost=0.05,
+        )
+        assert r.passed is True
+
+    def test_fail_with_cost(self) -> None:
+        r = VerificationResult(
+            verdict="FAIL",
+            raw_output="missing check",
+            failed_checks=[{"check": "output exists", "evidence": "no file"}],
+            token_usage={"input": 800, "output": 200},
+            cost=0.012,
+        )
+        assert r.passed is False
+        assert r.cost == 0.012
+        assert len(r.failed_checks) == 1

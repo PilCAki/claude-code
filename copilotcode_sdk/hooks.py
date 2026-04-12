@@ -19,6 +19,7 @@ from .prompt_compiler import PromptAssembler
 from .skill_assets import SkillTracker
 from .suggestions import build_prompt_suggestions, format_suggestions_prompt
 from .tasks import TaskStore
+from .events import EventBus, tool_called as _tool_called_event, tool_result as _tool_result_event, tool_denied as _tool_denied_event, file_changed as _file_changed_event
 from .retry import RetryPolicy, RetryState, build_retry_response
 from .token_budget import TokenBudget, parse_token_budget, strip_budget_directive, format_budget_status
 
@@ -59,6 +60,10 @@ NOISY_TOOL_NAMES = {
     "list_directory",
     "view",
     "read",
+    "bash",
+    "shell",
+    "execute",
+    "powershell",
 }
 WRITE_TOOL_NAMES = {"write_file", "write", "edit", "create_file"}
 READ_TOOL_NAMES = {"read", "read_file", "view", "cat"}
@@ -199,6 +204,7 @@ def build_default_hooks(
     assembler: PromptAssembler | None = None,
     completed_skills: set[str] | None = None,
     session_memory_controller: Any | None = None,
+    event_bus: EventBus | None = None,
 ) -> dict[str, Any]:
     allowed_roots = tuple(
         path.resolve(strict=False)
@@ -215,6 +221,7 @@ def build_default_hooks(
     _fired_one_shots: set[str] = set()
     _loaded_instructions: list[InstructionBundle] = []
     _skill_tracker = SkillTracker() if skill_map else None
+    _invoked_via_invoke_skill: set[str] = set()  # skills properly delegated
     _tool_call_count = [0]  # mutable counter in list for closure
     _last_extraction_turn = [0]
     _last_suggestion_turn = [0]
@@ -230,6 +237,9 @@ def build_default_hooks(
     _tool_result_cache: dict[str, str] = {}  # hash(tool_name+args) → result
     _file_changes: dict[str, str] = {}  # path → "created" | "modified" | "deleted"
     _active_paths: set[str] = set()  # paths touched by tool operations (reads + writes)
+    # Repeated failure detection: track consecutive failures of the same tool+error
+    _consecutive_failures: dict[str, int] = {}  # "tool:error_prefix" → count
+    _FAILURE_THRESHOLD = 3  # inject guidance after this many consecutive failures
     _pending_skill_invocations: list[dict[str, Any]] = []  # queued InvokeSkill invocations
     _mcp_manager: MCPLifecycleManager | None = (
         MCPLifecycleManager(list(config.mcp_servers)) if config.mcp_servers else None
@@ -421,6 +431,34 @@ def build_default_hooks(
         tool_args = _ensure_dict(input_data.get("toolArgs"))
         response: dict[str, Any] = {}
 
+        # Emit tool_called event
+        if event_bus is not None:
+            event_bus.emit(_tool_called_event(tool_name=tool_name))
+
+        # Track skills properly invoked via InvokeSkill
+        if tool_name == "invokeskill" and isinstance(tool_args, dict):
+            sk = str(tool_args.get("skill", "")).strip()
+            if sk:
+                _invoked_via_invoke_skill.add(sk)
+
+        # Block the CLI's built-in 'skill' slash command when InvokeSkill
+        # is available. The 'skill' command loads skill methodology into the
+        # current session, letting the model bypass InvokeSkill's child
+        # isolation, verification gate, and anti-gaming enforcement.
+        if tool_name == "skill" and skill_map:
+            skill_arg = ""
+            if isinstance(tool_args, dict):
+                skill_arg = str(tool_args.get("skill", ""))
+            if skill_arg in skill_map:
+                response["permissionDecision"] = "deny"
+                response["permissionDecisionReason"] = (
+                    f"The /skill command is disabled for workspace skills. "
+                    f"Use InvokeSkill(skill=\"{skill_arg}\") instead — it runs "
+                    f"the skill in an isolated child session with quality "
+                    f"verification. You MUST NOT do skill work directly."
+                )
+                return response
+
         violating_path = _find_disallowed_path(
             tool_args,
             allowed_roots,
@@ -496,6 +534,13 @@ def build_default_hooks(
             if modified_args != tool_args:
                 response["modifiedArgs"] = modified_args
 
+        # Emit tool_denied if permission was denied
+        if event_bus is not None and response.get("permissionDecision") == "deny":
+            event_bus.emit(_tool_denied_event(
+                tool_name=tool_name,
+                reason=response.get("permissionDecisionReason", ""),
+            ))
+
         return response or None
 
     def on_post_tool_use(
@@ -506,6 +551,79 @@ def build_default_hooks(
         tool_args = _ensure_dict(input_data.get("toolArgs"))
         tool_result = _ensure_dict(input_data.get("toolResult"))
         _tool_call_count[0] += 1
+
+        # --- Repeated failure detection ---
+        # Check if this tool call resulted in an error
+        _tool_error = None
+        if isinstance(tool_result, dict):
+            _tool_error = tool_result.get("error") or tool_result.get("stderr")
+        elif isinstance(tool_result, str) and "error" in tool_result.lower()[:50]:
+            _tool_error = tool_result
+        # Also check the input_data for error field (some tools report here)
+        if not _tool_error:
+            _raw_err = input_data.get("error")
+            if _raw_err:
+                _tool_error = str(_raw_err)
+
+        if _tool_error:
+            error_str = str(_tool_error)[:100]
+            failure_key = f"{tool_name}:{error_str}"
+            _consecutive_failures[failure_key] = _consecutive_failures.get(failure_key, 0) + 1
+            fail_count = _consecutive_failures[failure_key]
+
+            if fail_count >= _FAILURE_THRESHOLD:
+                guidance = (
+                    f"STUCK LOOP DETECTED: You have attempted `{tool_name}` "
+                    f"{fail_count} times with the same error:\n"
+                    f"  {error_str}\n\n"
+                    f"Repeating the same approach will not work. "
+                    f"Stop and diagnose: why is this failing? What is different "
+                    f"about what you're sending vs what the tool expects?\n\n"
+                    f"You MUST try a fundamentally different strategy. "
+                    f"If you're trying to create or write a file, consider:\n"
+                    f"- Writing via a shell command instead\n"
+                    f"- Breaking the work into smaller steps\n"
+                    f"- Using a different tool entirely\n"
+                    f"- Simplifying what you're producing"
+                )
+                # Reset counter so we don't spam every turn
+                _consecutive_failures[failure_key] = 0
+                return {
+                    "additionalContext": (
+                        f"<system-reminder>\n{guidance}\n</system-reminder>"
+                    ),
+                }
+        else:
+            # Success — clear all failure counters for this tool
+            keys_to_clear = [k for k in _consecutive_failures if k.startswith(f"{tool_name}:")]
+            for k in keys_to_clear:
+                del _consecutive_failures[k]
+
+        # Emit tool_result event
+        if event_bus is not None:
+            result_str = _stringify_result(tool_result)
+            event_bus.emit(_tool_result_event(
+                tool_name=tool_name,
+                result_chars=len(result_str),
+            ))
+
+        # Warn if CompleteSkill is called for a skill that wasn't delegated
+        # via InvokeSkill — this means the model did the work directly,
+        # bypassing child isolation and the verification pipeline.
+        if tool_name == "completeskill" and skill_map and isinstance(tool_args, dict):
+            sk = str(tool_args.get("skill", "")).strip()
+            if sk and sk not in _invoked_via_invoke_skill:
+                return {
+                    "additionalContext": (
+                        f"WARNING: You called CompleteSkill for '{sk}' but you "
+                        f"never invoked it via InvokeSkill. You appear to have "
+                        f"done the skill work directly in this session, bypassing "
+                        f"child isolation and the verification pipeline. "
+                        f"You MUST use InvokeSkill to delegate skill work to a "
+                        f"child agent. Call InvokeSkill(skill=\"{sk}\", force=true) "
+                        f"to redo this skill properly."
+                    ),
+                }
 
         # Detect InvokeSkill results and queue for async execution
         if tool_name == "invokeskill":
@@ -533,7 +651,7 @@ def build_default_hooks(
         # Track estimated context size for auto-compaction warnings
         result_text_len = len(_stringify_result(input_data.get("toolResult")))
         _estimated_context_chars[0] += result_text_len
-        max_context = DEFAULT_MAX_CONTEXT_CHARS
+        max_context = config.max_context_chars
         infinite_cfg = config.resolved_infinite_session_config()
         if infinite_cfg.get("enabled"):
             warning_threshold = infinite_cfg.get(
@@ -634,12 +752,17 @@ def build_default_hooks(
                     resolved = str(_resolve_path(file_path, config.working_path))
                     if tool_name in WRITE_TOOL_NAMES:
                         if resolved not in _file_changes:
-                            _file_changes[resolved] = "created"
+                            change_type = "created"
                         else:
-                            _file_changes[resolved] = "modified"
+                            change_type = "modified"
+                        _file_changes[resolved] = change_type
                         _active_paths.add(resolved)
+                        if event_bus is not None:
+                            event_bus.emit(_file_changed_event(path=resolved, change_type=change_type))
                     elif tool_name in DELETE_TOOL_NAMES:
                         _file_changes[resolved] = "deleted"
+                        if event_bus is not None:
+                            event_bus.emit(_file_changed_event(path=resolved, change_type="deleted"))
                     break
             # Invalidate cache when files change (writes invalidate reads of same path)
             if config.enable_tool_result_cache and tool_name in WRITE_TOOL_NAMES:
@@ -932,6 +1055,30 @@ def build_default_hooks(
         _pending_skill_invocations.clear()
         return drained
 
+    def get_tool_call_count() -> int:
+        """Accessor for the total tool call count."""
+        return _tool_call_count[0]
+
+    def get_recent_shell() -> list[tuple[str, str]]:
+        """Accessor for recent shell command signatures."""
+        return list(_recent_shell)
+
+    def get_read_file_state() -> dict[str, float]:
+        """Accessor for read-file tracking state (path → timestamp)."""
+        return dict(_read_file_state)
+
+    def get_estimated_context_chars() -> int:
+        """Accessor for the cumulative estimated context size in chars."""
+        return _estimated_context_chars[0]
+
+    def get_tool_result_cache_size() -> int:
+        """Accessor for the current tool result cache size."""
+        return len(_tool_result_cache)
+
+    def get_compaction_warned() -> bool:
+        """Accessor for whether the compaction/context warning has already fired."""
+        return _compaction_warned[0]
+
     return {
         "on_session_start": on_session_start,
         "on_user_prompt_submitted": on_user_prompt_submitted,
@@ -942,6 +1089,12 @@ def build_default_hooks(
         "get_file_changes": get_file_changes,
         "get_mcp_manager": get_mcp_manager,
         "drain_pending_skill_invocations": drain_pending_skill_invocations,
+        "get_tool_call_count": get_tool_call_count,
+        "get_recent_shell": get_recent_shell,
+        "get_read_file_state": get_read_file_state,
+        "get_estimated_context_chars": get_estimated_context_chars,
+        "get_tool_result_cache_size": get_tool_result_cache_size,
+        "get_compaction_warned": get_compaction_warned,
     }
 
 

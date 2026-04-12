@@ -15,7 +15,7 @@ from copilotcode_sdk.model_cost import (
 
 class TestCalculateCostOpus:
     def test_opus_input_only(self):
-        cost = calculate_cost("claude-opus-4-6", input_tokens=1_000_000)
+        cost = calculate_cost("claude-opus-4.6", input_tokens=1_000_000)
         assert cost.input_cost == pytest.approx(15.0)
         assert cost.output_cost == 0.0
         assert cost.total == pytest.approx(15.0)
@@ -29,7 +29,7 @@ class TestCalculateCostOpus:
 
 class TestCalculateCostSonnet:
     def test_sonnet_basic(self):
-        cost = calculate_cost("claude-sonnet-4-6", input_tokens=1_000_000, output_tokens=1_000_000)
+        cost = calculate_cost("claude-sonnet-4.6", input_tokens=1_000_000, output_tokens=1_000_000)
         assert cost.input_cost == pytest.approx(3.0)
         assert cost.output_cost == pytest.approx(15.0)
         assert cost.total == pytest.approx(18.0)
@@ -46,7 +46,7 @@ class TestCalculateCostHaiku:
 class TestCalculateCostCache:
     def test_cache_tokens(self):
         cost = calculate_cost(
-            "claude-opus-4-6",
+            "claude-opus-4.6",
             input_tokens=100_000,
             output_tokens=50_000,
             cache_read_tokens=200_000,
@@ -91,10 +91,10 @@ class TestUsageCost:
 
 class TestResolveModel:
     def test_alias_opus(self):
-        assert _resolve_model("opus") == "claude-opus-4-6"
+        assert _resolve_model("opus") == "claude-opus-4.6"
 
     def test_alias_sonnet(self):
-        assert _resolve_model("sonnet") == "claude-sonnet-4-6"
+        assert _resolve_model("sonnet") == "claude-sonnet-4.6"
 
     def test_prefix_match(self):
         resolved = _resolve_model("claude-opus-4-2")
@@ -109,10 +109,10 @@ class TestResolveModel:
 
 class TestGetKnowledgeCutoff:
     def test_opus_4_6(self):
-        assert get_knowledge_cutoff("claude-opus-4-6") == "May 2025"
+        assert get_knowledge_cutoff("claude-opus-4.6") == "May 2025"
 
     def test_sonnet_4_6(self):
-        assert get_knowledge_cutoff("claude-sonnet-4-6") == "August 2025"
+        assert get_knowledge_cutoff("claude-sonnet-4.6") == "August 2025"
 
     def test_sonnet_4_dated(self):
         assert get_knowledge_cutoff("claude-sonnet-4-20250514") == "January 2025"
@@ -131,12 +131,12 @@ class TestModelPricingCompleteness:
     def test_has_all_major_models(self):
         expected = [
             "claude-opus-4-20250514",
-            "claude-opus-4-6",
+            "claude-opus-4.6",
             "claude-sonnet-4-20250514",
-            "claude-sonnet-4-6",
+            "claude-sonnet-4.6",
             "claude-3-5-sonnet-20241022",
             "claude-3-5-haiku-20241022",
-            "claude-haiku-4-5-20251001",
+            "claude-haiku-4.5",
             "claude-3-opus-20240229",
             "claude-3-sonnet-20240229",
             "claude-3-haiku-20240307",

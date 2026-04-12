@@ -36,7 +36,7 @@ class SessionMemoryController:
         min_init_tokens: int = 10_000,
         min_update_tokens: int = 5_000,
         tool_calls_between_updates: int = 3,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = 3600.0,
         promote_on_destroy: bool = True,
     ) -> None:
         self._memory_store = memory_store

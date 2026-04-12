@@ -49,6 +49,40 @@ def _unique_names(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+# Valid Claude model names.  The CLI uses dots in version numbers
+# (e.g. claude-sonnet-4.6).  Any Claude model not in this set is rejected.
+_VALID_CLAUDE_MODELS: frozenset[str] = frozenset({
+    "claude-opus-4.6",
+    "claude-opus-4.5",
+    "claude-opus-4-20250514",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4-20250514",
+    "claude-haiku-4.5",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+})
+
+
+def _validate_model_name(model: str) -> str:
+    """Validate a model name.
+
+    For Claude models, checks against the known-valid set and raises
+    ValueError if the name isn't recognized.  Non-Claude models (GPT,
+    o3, etc.) are passed through without validation.
+    """
+    lower = model.lower()
+    if lower.startswith("claude-") and lower not in _VALID_CLAUDE_MODELS:
+        raise ValueError(
+            f"Unknown Claude model '{model}'.  "
+            f"Valid names: {sorted(_VALID_CLAUDE_MODELS)}"
+        )
+    return model
+
+
 @dataclass(slots=True)
 class CopilotCodeConfig:
     """Configuration for the CopilotCode wrapper around the Copilot SDK."""
@@ -82,8 +116,9 @@ class CopilotCodeConfig:
     extra_agents: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     default_agent: str | None = None
     infinite_sessions: bool | Mapping[str, Any] = True
-    shell_timeout_ms: int = 600_000
+    shell_timeout_ms: int = 3_600_000
     noisy_tool_char_limit: int = 8_000
+    max_context_chars: int = 800_000
     enforce_read_before_write: bool = True
     reminder_reinjection_interval: int = 15
     extraction_tool_call_interval: int = 20
@@ -111,7 +146,7 @@ class CopilotCodeConfig:
     session_memory_min_init_tokens: int = 10_000
     session_memory_min_update_tokens: int = 5_000
     session_memory_tool_calls_between_updates: int = 3
-    session_memory_timeout_seconds: float = 300.0
+    session_memory_timeout_seconds: float = 3600.0
     session_memory_promote_on_destroy: bool = True
     max_agent_turns: int = 0  # 0 = unlimited
     enable_coordinator_mode: bool = False
@@ -122,8 +157,28 @@ class CopilotCodeConfig:
     retry_max_delay_ms: int = 30_000
     retry_max_attempts: int = 3
     retry_jitter: bool = True
+    run_tag: str | None = None  # e.g. "20260408_0942" — used for learnings filenames
 
     def __post_init__(self) -> None:
+        if self.model is None:
+            import os
+            test_model = os.environ.get("COPILOTCODE_TEST_DEFAULT_MODEL")
+            if test_model:
+                self.model = test_model
+            else:
+                raise ValueError(
+                    "CopilotCodeConfig.model must be explicitly specified. "
+                    "Omitting it causes the SDK to use the CLI default (currently GPT-4.1), "
+                    "which may not be the intended model. Pass e.g. model='claude-sonnet-4.6'."
+                )
+        # CHECK 1: Validate the model name against the known-valid set.
+        _validate_model_name(self.model)
+        import logging as _cfg_logging
+        _cfg_logging.getLogger("copilotcode_sdk.config").info(
+            "Model configured: %s (provider: %s)",
+            self.model,
+            dict(self.provider) if self.provider else "default/copilot-pro",
+        )
         self.working_directory = _resolve_path(self.working_directory)
         self.memory_root = _resolve_path(self.memory_root or self.brand.memory_home())
         self.config_dir = _resolve_path(self.config_dir or self.brand.app_config_home())

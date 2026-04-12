@@ -15,7 +15,7 @@ def main() -> None:
     session = client.create_session()
     event = session.send_and_wait(
         "Inspect this repository and summarize how tests are expected to run.",
-        timeout=120.0,
+        timeout=3600.0,
     )
     print(event)
 

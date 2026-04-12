@@ -117,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional list of specific subsystem names to exercise.",
     )
+    exercise_parser.add_argument(
+        "--mode",
+        choices=("subsystem", "orchestration", "advanced", "cascade", "micro", "chain", "full"),
+        default="full",
+        help="Exercise mode: subsystem (API checks), orchestration (basic wiring), advanced (reactive behaviors), cascade (multi-subsystem interactions), micro (LLM single-prompt), chain (LLM multi-step), or full (all).",
+    )
     exercise_parser.set_defaults(func=_run_exercise)
 
     validate_parser = subparsers.add_parser(
@@ -308,6 +314,7 @@ def _run_exercise(args: argparse.Namespace) -> int:
         run_exercise(
             client,
             timeout=args.timeout,
+            mode=args.mode,
             subsystems=args.subsystems,
             save_report_path=args.save_report_path,
         ),

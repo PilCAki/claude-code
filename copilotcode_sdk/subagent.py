@@ -163,7 +163,9 @@ class EnforcedChildSession:
         effective_timeout = timeout or (
             self.spec.timeout_seconds if self.spec.timeout_seconds > 0 else None
         )
-        coro = self._child.session.send_and_wait(prompt)
+        # Pass timeout to the raw SDK session too — its default is only 60s
+        sdk_timeout = effective_timeout or 3600.0
+        coro = self._child.session.send_and_wait(prompt, timeout=sdk_timeout)
         if effective_timeout:
             return await asyncio.wait_for(coro, timeout=effective_timeout)
         return await coro
