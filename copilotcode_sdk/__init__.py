@@ -24,7 +24,7 @@ from .extraction import ExtractionMode, SESSION_MEMORY_SECTIONS, build_enforce_e
 from .session_memory import SessionMemoryController, SessionMemoryState
 from .session_state import SessionState, SessionStatus, RequiresActionDetails
 from .diff import DiffResult, generate_diff, generate_file_diff, summarize_changes, apply_patch
-from .events import Event, EventBus, EventType
+from .events import Event, EventBus, EventType, compaction_started, compaction_completed, context_window_updated
 from .retry import RetryPolicy, RetryState, build_retry_response
 from .subagent import ChildSession, EnforcedChildSession, MaxTurnsExceeded, SubagentContext, SubagentSpec, build_subagent_context
 from .mcp import build_mcp_prompt_section, build_mcp_delta, validate_mcp_server_config, MCPLifecycleManager, MCPServerStatus, MCPServerState
@@ -153,6 +153,9 @@ __all__ = [
     "Event",
     "EventBus",
     "EventType",
+    "compaction_started",
+    "compaction_completed",
+    "context_window_updated",
     "RetryPolicy",
     "RetryState",
     "build_retry_response",
