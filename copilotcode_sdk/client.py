@@ -29,6 +29,9 @@ from .events import (
     Event,
     EventBus,
     EventType,
+    compaction_completed as _compaction_completed_event,
+    compaction_started as _compaction_started_event,
+    context_window_updated as _context_window_updated_event,
     cost_accumulated as _cost_event,
     model_switched as _model_switched_event,
     session_destroyed as _session_destroyed_event,
@@ -474,6 +477,33 @@ class CopilotCodeSession:
                             source=str(child_source),
                         ))
 
+                # Forward child compaction events to parent event bus
+                if etype in ("compaction.started", "compaction.completed", "context_window.updated"):
+                    _get = (lambda k, d=None: event.get(k, d)) if isinstance(event, dict) else (lambda k, d=None: getattr(event, k, d))
+                    if etype == "compaction.started":
+                        parent_session._event_bus.emit(_compaction_started_event(
+                            pre_compaction_tokens=int(_get("pre_compaction_tokens", 0) or 0),
+                            system_tokens=int(_get("system_tokens", 0) or 0),
+                            tool_tokens=int(_get("tool_tokens", 0) or 0),
+                            message_count=int(_get("message_count", 0) or 0),
+                        ))
+                    elif etype == "compaction.completed":
+                        parent_session._event_bus.emit(_compaction_completed_event(
+                            pre_compaction_tokens=int(_get("pre_compaction_tokens", 0) or 0),
+                            post_compaction_tokens=int(_get("post_compaction_tokens", 0) or 0),
+                            tokens_removed=int(_get("tokens_removed", 0) or 0),
+                            messages_removed=int(_get("messages_removed", 0) or 0),
+                            success=bool(_get("success", True)),
+                            summary=str(_get("summary", "") or ""),
+                            compaction_tokens_used=_get("compaction_tokens_used") or {},
+                        ))
+                    elif etype == "context_window.updated":
+                        parent_session._event_bus.emit(_context_window_updated_event(
+                            current_tokens=int(_get("current_tokens", 0) or 0),
+                            token_limit=int(_get("token_limit", 0) or 0),
+                            utilization_ratio=float(_get("utilization_ratio", 0.0) or 0.0),
+                        ))
+
                 # Forward child events to parent's harness callback so the
                 # harness can log child activity (tool calls, turns, etc.)
                 if _parent_harness_callback is not None:
@@ -864,61 +894,145 @@ class CopilotCodeSession:
         )
 
     def _on_sdk_event(self, event: Any) -> None:
-        """Handle raw SDK session events — primarily ASSISTANT_USAGE."""
+        """Handle raw SDK session events — usage, compaction, context window."""
         try:
             etype = getattr(event, "type", None)
             if etype is not None and hasattr(etype, "value"):
                 etype = etype.value
-            if etype != "assistant.usage":
-                return
             data = getattr(event, "data", None)
-            if data is None:
-                return
-            input_tokens = int(getattr(data, "input_tokens", 0) or 0)
-            output_tokens = int(getattr(data, "output_tokens", 0) or 0)
-            cache_read = int(getattr(data, "cache_read_tokens", 0) or 0)
-            cache_write = int(getattr(data, "cache_write_tokens", 0) or 0)
-            if not (input_tokens or output_tokens or cache_read or cache_write):
-                return
-            self._state.record_usage(
+
+            if etype == "assistant.usage":
+                self._handle_usage_event(data)
+            elif etype == "session.compaction_start":
+                self._handle_compaction_start(data)
+            elif etype == "session.compaction_complete":
+                self._handle_compaction_complete(data)
+            elif etype == "session.info":
+                self._handle_session_info(data)
+        except Exception:
+            pass  # Never let event tracking break the session
+
+    def _handle_usage_event(self, data: Any) -> None:
+        """Process assistant.usage events for cost tracking."""
+        if data is None:
+            return
+        input_tokens = int(getattr(data, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(data, "output_tokens", 0) or 0)
+        cache_read = int(getattr(data, "cache_read_tokens", 0) or 0)
+        cache_write = int(getattr(data, "cache_write_tokens", 0) or 0)
+        if not (input_tokens or output_tokens or cache_read or cache_write):
+            return
+        self._state.record_usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_write,
+        )
+        model = getattr(data, "model", None) or self._model
+        # CHECK 2: On first usage event, verify the model actually used
+        # matches what was requested. The Copilot CLI silently falls back
+        # to its default model if the requested model isn't available.
+        if model and not self._model_verified and self._model:
+            self._model_verified = True
+            _verify_model_match(self._model, str(model))
+        if model:
+            turn_cost = calculate_cost(
+                model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_write,
             )
-            model = getattr(data, "model", None) or self._model
-            # CHECK 2: On first usage event, verify the model actually used
-            # matches what was requested. The Copilot CLI silently falls back
-            # to its default model if the requested model isn't available.
-            if model and not self._model_verified and self._model:
-                self._model_verified = True
-                _verify_model_match(self._model, str(model))
-            if model:
-                turn_cost = calculate_cost(
-                    model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read,
-                    cache_creation_tokens=cache_write,
-                )
-                self._cumulative_cost = UsageCost(
-                    input_cost=self._cumulative_cost.input_cost + turn_cost.input_cost,
-                    output_cost=self._cumulative_cost.output_cost + turn_cost.output_cost,
-                    cache_read_cost=self._cumulative_cost.cache_read_cost + turn_cost.cache_read_cost,
-                    cache_creation_cost=self._cumulative_cost.cache_creation_cost + turn_cost.cache_creation_cost,
-                )
-                self._event_bus.emit(_cost_event(
-                    total_cost=self._cumulative_cost.total,
-                    turn_cost=turn_cost.total,
-                    model=model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cache_read_tokens=cache_read,
-                    cache_write_tokens=cache_write,
-                    source=self._source,
-                ))
-        except Exception:
-            pass  # Never let usage tracking break the session
+            self._cumulative_cost = UsageCost(
+                input_cost=self._cumulative_cost.input_cost + turn_cost.input_cost,
+                output_cost=self._cumulative_cost.output_cost + turn_cost.output_cost,
+                cache_read_cost=self._cumulative_cost.cache_read_cost + turn_cost.cache_read_cost,
+                cache_creation_cost=self._cumulative_cost.cache_creation_cost + turn_cost.cache_creation_cost,
+            )
+            self._event_bus.emit(_cost_event(
+                total_cost=self._cumulative_cost.total,
+                turn_cost=turn_cost.total,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                source=self._source,
+            ))
+
+    def _handle_compaction_start(self, data: Any) -> None:
+        """Process session.compaction_start events."""
+        if data is None:
+            return
+        import logging
+        logger = logging.getLogger("copilotcode.compaction")
+        pre_tokens = int(getattr(data, "pre_compaction_tokens", 0) or 0)
+        system_tokens = int(getattr(data, "system_tokens", 0) or 0)
+        tool_tokens = int(getattr(data, "tool_definitions_tokens", 0) or 0)
+        msg_count = int(getattr(data, "pre_compaction_messages_length", 0) or 0)
+        logger.info(
+            "Compaction starting: pre_tokens=%d system=%d tool=%d messages=%d",
+            pre_tokens, system_tokens, tool_tokens, msg_count,
+        )
+        self._event_bus.emit(_compaction_started_event(
+            pre_compaction_tokens=pre_tokens,
+            system_tokens=system_tokens,
+            tool_tokens=tool_tokens,
+            message_count=msg_count,
+        ))
+
+    def _handle_compaction_complete(self, data: Any) -> None:
+        """Process session.compaction_complete events."""
+        if data is None:
+            return
+        import logging
+        logger = logging.getLogger("copilotcode.compaction")
+        pre_tokens = int(getattr(data, "pre_compaction_tokens", 0) or 0)
+        post_tokens = int(getattr(data, "post_compaction_tokens", 0) or 0)
+        tokens_removed = int(getattr(data, "tokens_removed", 0) or 0)
+        messages_removed = int(getattr(data, "messages_removed", 0) or 0)
+        success = bool(getattr(data, "success", True))
+        summary = str(getattr(data, "summary_content", "") or "")
+        # Extract compaction token usage breakdown
+        ctu = getattr(data, "compaction_tokens_used", None)
+        compaction_tokens: dict[str, int] = {}
+        if ctu is not None:
+            compaction_tokens = {
+                "input": int(getattr(ctu, "input", 0) or 0),
+                "output": int(getattr(ctu, "output", 0) or 0),
+                "cached_input": int(getattr(ctu, "cached_input", 0) or 0),
+            }
+        logger.info(
+            "Compaction complete: pre=%d post=%d removed=%d msgs_removed=%d success=%s",
+            pre_tokens, post_tokens, tokens_removed, messages_removed, success,
+        )
+        self._event_bus.emit(_compaction_completed_event(
+            pre_compaction_tokens=pre_tokens,
+            post_compaction_tokens=post_tokens,
+            tokens_removed=tokens_removed,
+            messages_removed=messages_removed,
+            success=success,
+            summary=summary,
+            compaction_tokens_used=compaction_tokens,
+        ))
+
+    def _handle_session_info(self, data: Any) -> None:
+        """Process session.info events — extract context_window data if present."""
+        if data is None:
+            return
+        info_type = getattr(data, "info_type", None)
+        if info_type != "context_window":
+            return
+        current_tokens = int(getattr(data, "current_tokens", 0) or 0)
+        token_limit = int(getattr(data, "token_limit", 0) or 0)
+        if not (current_tokens or token_limit):
+            return
+        utilization = current_tokens / token_limit if token_limit > 0 else 0.0
+        self._event_bus.emit(_context_window_updated_event(
+            current_tokens=current_tokens,
+            token_limit=token_limit,
+            utilization_ratio=utilization,
+        ))
 
     def _accumulate_usage(self, result: Any) -> None:
         """Extract token usage from SDK result and accumulate cost (fallback path)."""
@@ -1369,6 +1483,14 @@ class CopilotCodeClient:
             wrapped._drain_skills = drain_fn
         wrapped._completed_skills = captured.get("_completed_skills")
         wrapped._skill_map = captured.get("_skill_map")
+        # Wire compaction events to reset hook-level context estimation
+        _notify_compaction = raw_hooks.get("notify_compaction_completed")
+        if _notify_compaction is not None:
+            def _on_compaction_event(event: Event) -> None:
+                post = event.data.get("post_compaction_tokens", 0)
+                if post:
+                    _notify_compaction(post)
+            wrapped.event_bus.subscribe(_on_compaction_event, event_type=EventType.compaction_completed)
         # Wire session into CompleteSkill's verification gate
         session_holder = captured.get("_session_holder")
         if session_holder is not None and isinstance(session_holder, list):
@@ -1420,6 +1542,14 @@ class CopilotCodeClient:
             wrapped._drain_skills = drain_fn
         wrapped._completed_skills = captured.get("_completed_skills")
         wrapped._skill_map = captured.get("_skill_map")
+        # Wire compaction events to reset hook-level context estimation
+        _notify_compaction_r = raw_hooks.get("notify_compaction_completed")
+        if _notify_compaction_r is not None:
+            def _on_compaction_event_r(event: Event) -> None:
+                post = event.data.get("post_compaction_tokens", 0)
+                if post:
+                    _notify_compaction_r(post)
+            wrapped.event_bus.subscribe(_on_compaction_event_r, event_type=EventType.compaction_completed)
         # Wire session into CompleteSkill's verification gate
         session_holder = captured.get("_session_holder")
         if session_holder is not None and isinstance(session_holder, list):

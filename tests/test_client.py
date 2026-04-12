@@ -1468,3 +1468,169 @@ def test_accumulate_usage_includes_source(tmp_path: Path) -> None:
     assert d["source"] == "exercise"
     assert d["input_tokens"] == 400
     assert d["output_tokens"] == 150
+
+
+# ── SDK event visibility: compaction & context window ─────────────────
+
+
+def test_sdk_compaction_start_event(tmp_path: Path) -> None:
+    """session.compaction_start events should emit compaction_started on the bus."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        pre_compaction_tokens = 50000
+        system_tokens = 5000
+        tool_definitions_tokens = 3000
+        pre_compaction_messages_length = 42
+
+    class FakeEvent:
+        type = "session.compaction_start"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    compaction_events = [e for e in events if e.type == EventType.compaction_started]
+    assert len(compaction_events) == 1
+    d = compaction_events[0].data
+    assert d["pre_compaction_tokens"] == 50000
+    assert d["system_tokens"] == 5000
+    assert d["tool_tokens"] == 3000
+    assert d["message_count"] == 42
+
+
+def test_sdk_compaction_complete_event(tmp_path: Path) -> None:
+    """session.compaction_complete events should emit compaction_completed on the bus."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeTokensUsed:
+        input = 1000
+        output = 500
+        cached_input = 200
+
+    class FakeData:
+        pre_compaction_tokens = 50000
+        post_compaction_tokens = 20000
+        tokens_removed = 30000
+        messages_removed = 15
+        success = True
+        summary_content = "Session compacted successfully."
+        compaction_tokens_used = FakeTokensUsed()
+
+    class FakeEvent:
+        type = "session.compaction_complete"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    compaction_events = [e for e in events if e.type == EventType.compaction_completed]
+    assert len(compaction_events) == 1
+    d = compaction_events[0].data
+    assert d["pre_compaction_tokens"] == 50000
+    assert d["post_compaction_tokens"] == 20000
+    assert d["tokens_removed"] == 30000
+    assert d["messages_removed"] == 15
+    assert d["success"] is True
+    assert d["summary"] == "Session compacted successfully."
+    assert d["compaction_tokens_used"]["input"] == 1000
+    assert d["compaction_tokens_used"]["output"] == 500
+    assert d["compaction_tokens_used"]["cached_input"] == 200
+
+
+def test_sdk_context_window_event(tmp_path: Path) -> None:
+    """session.info events with context_window info_type should emit context_window_updated."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        info_type = "context_window"
+        current_tokens = 80000
+        token_limit = 200000
+
+    class FakeEvent:
+        type = "session.info"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    ctx_events = [e for e in events if e.type == EventType.context_window_updated]
+    assert len(ctx_events) == 1
+    d = ctx_events[0].data
+    assert d["current_tokens"] == 80000
+    assert d["token_limit"] == 200000
+    assert abs(d["utilization_ratio"] - 0.4) < 0.01
+
+
+def test_sdk_session_info_non_context_ignored(tmp_path: Path) -> None:
+    """session.info events with non-context info_type should not emit context events."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        info_type = "notification"
+        current_tokens = 0
+        token_limit = 0
+
+    class FakeEvent:
+        type = "session.info"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    ctx_events = [e for e in events if e.type == EventType.context_window_updated]
+    assert len(ctx_events) == 0
+
+
+def test_sdk_usage_event_still_works_after_refactor(tmp_path: Path) -> None:
+    """assistant.usage events should continue to work after the _on_sdk_event refactor."""
+    from copilotcode_sdk.events import EventType
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSession()
+    session = CopilotCodeSession(fake, store, model="claude-sonnet-4.6")
+
+    events: list = []
+    session.event_bus.subscribe(lambda e: events.append(e))
+
+    class FakeData:
+        input_tokens = 500
+        output_tokens = 200
+        cache_read_tokens = 50
+        cache_write_tokens = 10
+        model = "claude-sonnet-4.6"
+
+    class FakeEvent:
+        type = "assistant.usage"
+        data = FakeData()
+
+    session._on_sdk_event(FakeEvent())
+
+    cost_events = [e for e in events if e.type == EventType.cost_accumulated]
+    assert len(cost_events) == 1
+    assert session._state.total_input_tokens == 500
+    assert session._state.total_output_tokens == 200

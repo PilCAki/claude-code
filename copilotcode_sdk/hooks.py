@@ -1079,6 +1079,17 @@ def build_default_hooks(
         """Accessor for whether the compaction/context warning has already fired."""
         return _compaction_warned[0]
 
+    def notify_compaction_completed(post_compaction_tokens: int) -> None:
+        """Reset estimated context tracking after a real compaction event.
+
+        When the SDK reports an actual compaction, the char-based estimation
+        becomes stale.  Reset it to match reality so subsequent warnings are
+        accurate.  We convert tokens back to chars using the ~4 chars/token
+        heuristic that the estimation already uses.
+        """
+        _estimated_context_chars[0] = post_compaction_tokens * 4
+        _compaction_warned[0] = False  # allow future warnings
+
     return {
         "on_session_start": on_session_start,
         "on_user_prompt_submitted": on_user_prompt_submitted,
@@ -1095,6 +1106,7 @@ def build_default_hooks(
         "get_estimated_context_chars": get_estimated_context_chars,
         "get_tool_result_cache_size": get_tool_result_cache_size,
         "get_compaction_warned": get_compaction_warned,
+        "notify_compaction_completed": notify_compaction_completed,
     }
 
 

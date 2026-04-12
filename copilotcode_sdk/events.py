@@ -32,6 +32,9 @@ class EventType(Enum):
     error_occurred = "error.occurred"
     file_changed = "file.changed"
     memory_saved = "memory.saved"
+    compaction_started = "compaction.started"
+    compaction_completed = "compaction.completed"
+    context_window_updated = "context_window.updated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,55 @@ def error_occurred(*, error: str, recoverable: bool, context: str = "") -> Event
 
 def file_changed(*, path: str, change_type: str) -> Event:
     return Event(EventType.file_changed, data={"path": path, "change_type": change_type})
+
+
+def compaction_started(
+    *,
+    pre_compaction_tokens: int = 0,
+    system_tokens: int = 0,
+    tool_tokens: int = 0,
+    message_count: int = 0,
+) -> Event:
+    return Event(EventType.compaction_started, data={
+        "pre_compaction_tokens": pre_compaction_tokens,
+        "system_tokens": system_tokens,
+        "tool_tokens": tool_tokens,
+        "message_count": message_count,
+    })
+
+
+def compaction_completed(
+    *,
+    pre_compaction_tokens: int = 0,
+    post_compaction_tokens: int = 0,
+    tokens_removed: int = 0,
+    messages_removed: int = 0,
+    success: bool = True,
+    summary: str = "",
+    compaction_tokens_used: dict[str, int] | None = None,
+) -> Event:
+    return Event(EventType.compaction_completed, data={
+        "pre_compaction_tokens": pre_compaction_tokens,
+        "post_compaction_tokens": post_compaction_tokens,
+        "tokens_removed": tokens_removed,
+        "messages_removed": messages_removed,
+        "success": success,
+        "summary": summary,
+        "compaction_tokens_used": compaction_tokens_used or {},
+    })
+
+
+def context_window_updated(
+    *,
+    current_tokens: int = 0,
+    token_limit: int = 0,
+    utilization_ratio: float = 0.0,
+) -> Event:
+    return Event(EventType.context_window_updated, data={
+        "current_tokens": current_tokens,
+        "token_limit": token_limit,
+        "utilization_ratio": utilization_ratio,
+    })
 
 
 EventListener = Callable[[Event], None]
