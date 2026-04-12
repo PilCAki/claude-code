@@ -693,6 +693,143 @@ def test_stream_fallback(tmp_path: Path) -> None:
     assert chunks[0]["type"] == "message_stop"
 
 
+class FakeSessionWithStream(FakeSession):
+    """FakeSession that supports stream() yielding structured chunks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_chunks: list[dict] = [
+            {"type": "text_delta", "text": "Hello"},
+            {"type": "tool_use_start", "tool_name": "Read", "tool_id": "t1"},
+            {"type": "tool_result", "tool_name": "Read", "result": "file contents"},
+            {"type": "usage", "input_tokens": 100, "output_tokens": 50},
+            {"type": "message_stop"},
+        ]
+
+    async def stream(self, prompt, *, attachments=None, mode=None):
+        self.sent.append((prompt, attachments, mode))
+        for chunk in self.stream_chunks:
+            yield chunk
+
+
+def test_stream_yields_structured_chunks(tmp_path: Path) -> None:
+    """stream() should yield normalized structured chunks with type keys."""
+    from copilotcode_sdk.client import CopilotCodeSession
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSessionWithStream()
+    session = CopilotCodeSession(fake, store)
+
+    chunks = []
+
+    async def _collect():
+        async for chunk in session.stream("hello"):
+            chunks.append(chunk)
+
+    asyncio.run(_collect())
+    assert len(chunks) == 5
+    assert chunks[0] == {"type": "text_delta", "text": "Hello"}
+    assert chunks[1] == {"type": "tool_use_start", "tool_name": "Read", "tool_id": "t1"}
+    assert chunks[2] == {"type": "tool_result", "tool_name": "Read", "result": "file contents"}
+    assert chunks[3] == {"type": "usage", "input_tokens": 100, "output_tokens": 50}
+    assert chunks[4] == {"type": "message_stop"}
+
+
+def test_stream_normalizes_non_dict_chunks(tmp_path: Path) -> None:
+    """stream() should normalize non-dict chunks to dict format."""
+    from copilotcode_sdk.client import CopilotCodeSession
+
+    class ChunkWithToDict:
+        def to_dict(self):
+            return {"type": "text_delta", "text": "from to_dict"}
+
+    class FakeSessionMixed(FakeSession):
+        async def stream(self, prompt, *, attachments=None, mode=None):
+            yield ChunkWithToDict()
+            yield "raw string chunk"
+            yield {"type": "message_stop"}
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSessionMixed()
+    session = CopilotCodeSession(fake, store)
+
+    chunks = []
+
+    async def _collect():
+        async for chunk in session.stream("hello"):
+            chunks.append(chunk)
+
+    asyncio.run(_collect())
+    assert len(chunks) == 3
+    assert chunks[0] == {"type": "text_delta", "text": "from to_dict"}
+    assert chunks[1] == {"type": "raw", "data": "raw string chunk"}
+    assert chunks[2] == {"type": "message_stop"}
+
+
+def test_stream_until_complete_calls_on_stream_event(tmp_path: Path) -> None:
+    """stream_until_complete() should call on_stream_event for each chunk."""
+    from copilotcode_sdk.client import CopilotCodeSession
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSessionWithStream()
+    # Add a result to message_stop so stream_until_complete gets a return value
+    fake.stream_chunks[-1] = {"type": "message_stop", "result": {"status": "ok"}}
+    session = CopilotCodeSession(fake, store)
+
+    received_events: list[dict] = []
+
+    def _on_event(chunk: dict) -> None:
+        received_events.append(chunk)
+
+    async def _run():
+        return await session.stream_until_complete(
+            "do stuff",
+            on_stream_event=_on_event,
+        )
+
+    result = asyncio.run(_run())
+    assert result == {"status": "ok"}
+    assert len(received_events) == 5
+    types = [e.get("type") for e in received_events]
+    assert "text_delta" in types
+    assert "tool_use_start" in types
+    assert "message_stop" in types
+
+
+def test_stream_until_complete_retries_on_missing(tmp_path: Path) -> None:
+    """stream_until_complete() should retry when completion_check returns missing."""
+    from copilotcode_sdk.client import CopilotCodeSession
+
+    store = MemoryStore(tmp_path, tmp_path / ".mem")
+    fake = FakeSessionWithStream()
+    fake.stream_chunks = [{"type": "message_stop", "result": {"status": "ok"}}]
+    session = CopilotCodeSession(fake, store)
+
+    call_count = 0
+
+    def _check() -> list[str]:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return ["skill_a"]
+        return []
+
+    events: list[dict] = []
+
+    async def _run():
+        return await session.stream_until_complete(
+            "go",
+            completion_check=_check,
+            on_stream_event=lambda c: events.append(c),
+        )
+
+    result = asyncio.run(_run())
+    assert result == {"status": "ok"}
+    # Initial prompt + 2 continuation prompts = 3 total sends
+    assert len(fake.sent) == 3
+    assert call_count == 3
+
+
 # ---------------------------------------------------------------------------
 # Session task convenience methods (Wave 3.2 items 12-13)
 # ---------------------------------------------------------------------------
