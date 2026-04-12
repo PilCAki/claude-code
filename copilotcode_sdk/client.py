@@ -733,33 +733,57 @@ class CopilotCodeSession:
         *,
         attachments: list[dict[str, Any]] | None = None,
         mode: str | None = None,
+        timeout: float = 3600.0,
     ):
-        """Stream response chunks from the model.
+        """Stream response events from the model.
 
-        Yields dicts with at least a ``"type"`` key. The underlying SDK
-        must expose a ``stream()`` async generator. If it doesn't, this
-        falls back to ``send_and_wait()`` and yields a single chunk.
+        Yields dicts with at least a ``"type"`` key:
+        - ``{"type": "text_delta", "text": "..."}`` -- incremental text
+        - ``{"type": "tool_use_start", "tool_name": "...", "tool_id": "..."}``
+        - ``{"type": "tool_result", "tool_name": "...", "result": "..."}``
+        - ``{"type": "usage", "input_tokens": N, "output_tokens": N, ...}``
+        - ``{"type": "message_stop"}`` -- final event
         """
         self._state.start_turn()
+        self._event_bus.emit(_turn_started_event(turn_count=self._state.turn_count))
         raw_stream = getattr(self._session, "stream", None)
         if raw_stream is not None and callable(raw_stream):
             try:
                 async for chunk in raw_stream(prompt, attachments=attachments, mode=mode):
-                    yield chunk
-                    # Accumulate usage from final chunk if present
-                    if isinstance(chunk, dict) and chunk.get("type") == "message_stop":
-                        self._accumulate_usage(chunk)
+                    # Normalize SDK chunks to consistent dict format
+                    if isinstance(chunk, dict):
+                        yield chunk
+                    elif hasattr(chunk, "to_dict"):
+                        yield chunk.to_dict()
+                    else:
+                        yield {"type": "raw", "data": str(chunk)}
+                    # Accumulate usage from chunks that carry it
+                    if isinstance(chunk, dict):
+                        if chunk.get("type") == "message_stop":
+                            self._accumulate_usage(chunk)
+                        elif chunk.get("type") == "assistant.usage":
+                            self._accumulate_usage(chunk)
             finally:
+                self._event_bus.emit(_turn_completed_event(
+                    turn_count=self._state.turn_count,
+                    input_tokens=self._state.total_input_tokens,
+                    output_tokens=self._state.total_output_tokens,
+                ))
                 self._state.end_turn()
         else:
-            # Fallback: run send_and_wait and yield as single chunk
+            # Fallback: send_and_wait, yield single result
             try:
                 result = await self._session.send_and_wait(
-                    prompt, attachments=attachments, mode=mode, timeout=3600.0,
+                    prompt, attachments=attachments, mode=mode, timeout=timeout,
                 )
                 self._accumulate_usage(result)
                 yield {"type": "message_stop", "result": result}
             finally:
+                self._event_bus.emit(_turn_completed_event(
+                    turn_count=self._state.turn_count,
+                    input_tokens=self._state.total_input_tokens,
+                    output_tokens=self._state.total_output_tokens,
+                ))
                 self._state.end_turn()
 
     async def send_and_wait(
@@ -890,6 +914,105 @@ class CopilotCodeSession:
                                 missing=", ".join(missing),
                             ),
                             timeout=timeout,
+                        )
+
+        return result
+
+    async def stream_until_complete(
+        self,
+        prompt: str,
+        *,
+        completion_check: Callable[[], list[str]] | None = None,
+        holistic_check: Callable[[], Any] | None = None,
+        max_continuations: int = 5,
+        max_holistic_retries: int = 2,
+        continuation_template: str = (
+            "You have NOT completed all skills. "
+            "The following output directories are still missing or empty: {missing}. "
+            "Continue executing skills in dependency order using InvokeSkill. "
+            "Do not stop until all skills are complete and all output directories have content."
+        ),
+        holistic_feedback_template: str = (
+            "## HOLISTIC VERIFICATION FAILED\n\n"
+            "{feedback}\n\n"
+            "Re-invoke the affected skill(s) with force=true to fix these issues. "
+            "Do not stop until all cross-skill issues are resolved."
+        ),
+        on_stream_event: Callable[[dict], None] | None = None,
+        timeout: float = 3600.0,
+    ) -> Any:
+        """Like send_until_complete but streams each turn for real-time visibility.
+
+        ``on_stream_event`` is called for every streaming chunk, allowing the
+        harness to log tool calls, text output, etc. in real time.
+        """
+
+        async def _stream_turn(p: str) -> Any:
+            last_result = None
+            async for chunk in self.stream(p, timeout=timeout):
+                if on_stream_event is not None:
+                    try:
+                        on_stream_event(chunk)
+                    except Exception:
+                        pass
+                if isinstance(chunk, dict) and chunk.get("type") == "message_stop":
+                    last_result = chunk.get("result")
+            return last_result
+
+        result = await _stream_turn(prompt)
+
+        if completion_check is None and holistic_check is None:
+            return result
+
+        # Phase 1: Structural completion
+        if completion_check is not None:
+            for attempt in range(1, max_continuations + 1):
+                missing = completion_check()
+                if not missing:
+                    break
+                result = await _stream_turn(
+                    continuation_template.format(missing=", ".join(missing))
+                )
+
+        # Phase 2: Holistic cross-skill verification
+        if holistic_check is not None:
+            import logging as _logging
+            from .holistic_verifier import format_holistic_feedback
+
+            _h_logger = _logging.getLogger("copilotcode.holistic_verifier")
+            max_holistic_malfunctions = 2
+
+            for h_attempt in range(1, max_holistic_retries + max_holistic_malfunctions + 1):
+                h_result = await holistic_check()
+                if h_result.passed:
+                    break
+                if h_result.is_malfunction:
+                    max_holistic_malfunctions -= 1
+                    _h_logger.warning(
+                        "Holistic verifier MALFUNCTION (attempt %d, %d retries left): %s",
+                        h_attempt, max_holistic_malfunctions,
+                        h_result.raw_output[:300],
+                    )
+                    if max_holistic_malfunctions <= 0:
+                        _h_logger.error(
+                            "Holistic verifier exhausted malfunction retries"
+                        )
+                        break
+                    continue  # retry -- don't send feedback to orchestrator
+                feedback = format_holistic_feedback(h_result)
+                result = await _stream_turn(
+                    holistic_feedback_template.format(feedback=feedback)
+                )
+                # After orchestrator fixes, re-check structural completeness
+                if completion_check is not None:
+                    for attempt in range(1, max_continuations + 1):
+                        missing = completion_check()
+                        if not missing:
+                            break
+                        result = await _stream_turn(
+                            continuation_template.format(
+                                missing=", ".join(missing),
+                            )
                         )
 
         return result
